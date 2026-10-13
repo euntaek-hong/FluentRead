@@ -105,6 +105,8 @@ describe('personal Firefox release', () => {
         await expect(signRelease(config, false, ports)).rejects.toThrow('approval timeout');
         expect(submit).toHaveBeenCalledTimes(1);
         expect(JSON.parse(await readFile(recordFile, 'utf8')).state).toBe('pending');
+        // web-ext caches its upload UUID in source-dir after the first submission.
+        await writeFile(join(stage, '.amo-upload-uuid'), 'upload-uuid-fixture');
         await expect(signRelease(config, false, ports)).rejects.toThrow('No duplicate upload');
         expect(submit).toHaveBeenCalledTimes(1);
         const pendingPorts = {...ports, amoRequest: async () => ({id: 7, channel: 'unlisted', file: {status: 'unreviewed'}}), downloadSigned: async () => false};

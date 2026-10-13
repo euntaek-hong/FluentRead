@@ -227,7 +227,9 @@ export async function signRelease(config, resumeOnly, ports = {}) {
     const packageZip = await validateArchive(await readFile(extensionPath), config);
     const stageFiles = await readdir(stage, {recursive: true, withFileTypes: true});
     const stageNames = stageFiles.filter(entry => entry.isFile()).map(entry =>
-        path.relative(stage, path.join(entry.parentPath, entry.name)).replaceAll('\\', '/'));
+        path.relative(stage, path.join(entry.parentPath, entry.name)).replaceAll('\\', '/'))
+        // web-ext writes this cache after upload; it is not an extension payload file.
+        .filter(name => name !== '.amo-upload-uuid');
     const zipNames = Object.values(packageZip.files).filter(entry => !entry.dir).map(entry => entry.name);
     if (stageNames.sort().join('\n') !== zipNames.sort().join('\n')) throw new Error('Staging files differ from package');
     for (const name of zipNames) {
@@ -265,6 +267,7 @@ export async function signRelease(config, resumeOnly, ports = {}) {
     await save(recordPath, record);
     const submitted = await request(route, auth);
     if (submitted && await download(submitted, directory, record, config)) return;
+    if (submitted) await save(recordPath, {...record, amoVersionId: submitted.id, amoStatus: submitted.file?.status});
     console.log('[firefox-private] Submission reserved. Resume with firefox:sign -- --resume; do not repackage this version.');
     if (failure) throw failure;
 }
