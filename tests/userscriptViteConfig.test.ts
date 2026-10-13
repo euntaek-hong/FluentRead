@@ -8,6 +8,7 @@ import {gunzipSync, gzipSync} from 'node:zlib';
 import {runInNewContext} from 'node:vm';
 import {describe, expect, it, vi} from 'vitest';
 import {ungzip} from 'pako';
+import {normalizePath} from 'vite';
 import {zhCNMessages, UI_LANGUAGE_BUNDLES, userscriptMessages} from '@/userscript/languageBundles';
 import {zhCNMessages as extensionChinese} from '@/src/core/i18n/messages/zh-CN';
 import {UI_LANGUAGE_BUNDLES as extensionBundles} from '@/src/core/i18n/bundles';
@@ -42,6 +43,7 @@ import {
 const entrypointId = resolve(process.cwd(), 'entrypoints/userscript-injection-fixture.ts');
 const sourceModuleId = resolve(process.cwd(), 'src/app/content/runtime.ts');
 const vueScriptModuleId = `${resolve(process.cwd(), 'src/features/selection-translation/ui/SelectionTranslator.vue')}?vue&type=script&setup=true&lang.ts`;
+const viteModuleId = (id: string) => normalizePath(id.split('?', 1)[0]);
 
 // 使用真实 Vite/CommonJS 与发布配置的同一选项，验证 require 时序而不是断言配置字面量。
 async function bundledCommonjsOwner(entry: string, files: Record<string, string> = {}) {
@@ -321,7 +323,7 @@ describe('userscript browser shim injection', () => {
         controller.updatePreferences({enabled: true, hotkey: 'Alt+H', hotkeyEnabled: true, mode: 'surprisal-local', model: 'qwen3-0.6b', density: 'low', color: 'mint', style: 'underline', intensity: 'standard'});
         expect(controller.retry()).toMatchObject({enabled: false, mode: 'surprisal-local'});
         controller.refresh();controller.dispose();expect(controller.getState().enabled).toBe(false);
-        expect(userscriptAliases.find(alias => alias.find === '@/src/features/information-highlight/public')?.replacement).toMatch(/userscript\/informationHighlight\.ts$/u);
+        expect(userscriptAliases.find(alias => alias.find === '@/src/features/information-highlight/public')?.replacement).toMatch(/userscript[\\/]informationHighlight\.ts$/u);
     });
     it('pins each remote language file to a commit containing exactly its built contents', () => {
         const defines = (userscriptConfig as {define: Record<string, string>}).define;
@@ -359,6 +361,17 @@ describe('userscript browser shim injection', () => {
             vi.unstubAllGlobals();
         }
         expect(moduleSource).toContain(createHash('sha256').update(gunzipSync(Buffer.from(base64!, 'base64'))).digest('hex'));
+    });
+
+    it('compresses the Chinese catalog when Vite supplies a slash-normalized importer on Windows', () => {
+        const plugin = createUserscriptCatalogCompressionPlugin() as unknown as {
+            resolveId: (source: string, importer: string) => string | null;
+        };
+        const nativeImporter = resolve(process.cwd(), 'src/core/i18n/index.ts');
+        const viteImporter = nativeImporter.replaceAll('\\', '/') + '?v=fixture';
+        expect(plugin.resolveId('./messages/zh-CN', viteImporter))
+            .toBe(plugin.resolveId('./messages/zh-CN', nativeImporter));
+        expect(plugin.resolveId('./messages/zh-CN', viteImporter)).toBeTruthy();
     });
 
     it('embeds the English bundle without the reader-only keys and preserves every other field', () => {
@@ -435,11 +448,11 @@ describe('userscript browser shim injection', () => {
             .map((entry) => [entry.find, entry.replacement]));
 
         for (const feature of ['area-translation', 'image-translation', 'video-subtitle', 'personal-corrections']) {
-            expect(stringAliases.get(`@/src/features/${feature}/public`)).toMatch(/userscript\/unsupportedCapabilities\.ts$/u);
+            expect(stringAliases.get(`@/src/features/${feature}/public`)).toMatch(/userscript[\\/]unsupportedCapabilities\.ts$/u);
         }
-        expect(stringAliases.get('@/src/features/writing-assistant/public')).toMatch(/userscript\/writingAssistant\.ts$/u);
-        expect(stringAliases.get('@/src/platform/storage/credentialContext')).toMatch(/userscript\/credentialContext\.ts$/u);
-        expect(stringAliases.get('@/src/platform/storage/configStorageRuntime')).toMatch(/userscript\/storage\.ts$/u);
+        expect(stringAliases.get('@/src/features/writing-assistant/public')).toMatch(/userscript[\\/]writingAssistant\.ts$/u);
+        expect(stringAliases.get('@/src/platform/storage/credentialContext')).toMatch(/userscript[\\/]credentialContext\.ts$/u);
+        expect(stringAliases.get('@/src/platform/storage/configStorageRuntime')).toMatch(/userscript[\\/]storage\.ts$/u);
         expect(userscriptAliases.at(-1)?.find).toBe('@');
     });
 
@@ -447,7 +460,7 @@ describe('userscript browser shim injection', () => {
         const plugins = (userscriptConfig as {plugins: Array<{name: string; generateBundle?: {handler: Function}}>}).plugins;
         const plugin = plugins.find(item => item.name === 'bundle-userscript-css')!;
         const entry = {type: 'chunk', isEntry: true, code: 'var fixture = 1;', moduleIds: []};
-        const correctionModule = `${resolve(process.cwd(), 'src/features/personal-corrections/ui/PersonalCorrectionsPanel.vue')}?vue&type=script`;
+        const correctionModule = `${viteModuleId(resolve(process.cwd(), 'src/features/personal-corrections/ui/PersonalCorrectionsPanel.vue'))}?vue&type=script`;
         const otherChunk = {type: 'chunk', isEntry: false, code: '', moduleIds: [correctionModule]};
         await expect(Reflect.apply(plugin.generateBundle!.handler, {}, [{}, {'entry.js': entry, 'other.js': otherChunk}]))
             .rejects.toThrow(`Userscript bundle contains unsupported personal correction feature: ${correctionModule}`);
@@ -477,7 +490,7 @@ describe('userscript browser shim injection', () => {
         const dexieAlias = userscriptAliases.find((entry) => entry.find instanceof RegExp
             && (entry.find as RegExp).test('dexie'));
 
-        expect(dexieAlias?.replacement).toMatch(/userscript\/dexie\.ts$/u);
+        expect(dexieAlias?.replacement).toMatch(/userscript[\\/]dexie\.ts$/u);
         // 别名必须严格匹配裸模块名；否则 userscript/dexie.ts 内部对实现产物的引用会被改写回自身。
         expect((dexieAlias!.find as RegExp).test('dexie/dist/dexie.min.js')).toBe(false);
     });
@@ -1004,11 +1017,11 @@ describe('standalone locked public and private suffix pure-data encoding', () =>
             const {default: configuration} = await import('@/userscript/vite.config');
             const plugins = (configuration as {plugins: Array<{name: string; generateBundle?: {handler: Function}}>}).plugins;
             const plugin = plugins.find(item => item.name === 'bundle-userscript-css')!;
-            const entry = {type: 'chunk', isEntry: true, code: 'var suffixOwnerFixture = 1;', moduleIds: [dataPath]};
+            const entry = {type: 'chunk', isEntry: true, code: 'var suffixOwnerFixture = 1;', moduleIds: [viteModuleId(dataPath)]};
             await Reflect.apply(plugin.generateBundle!.handler, {}, [{}, {'entry.js': entry}]);
             expect(entry.code).toContain('tldts 7.4.10 — MIT');
             expect(entry.code).toContain(originalLicense.trim());
-            expect(entry.moduleIds).toEqual([dataPath]);
+            expect(entry.moduleIds).toEqual([viteModuleId(dataPath)]);
             expect(readFileSync(resolve(packageRoot, 'LICENSE'), 'utf8')).toBe(originalLicense);
         } finally {
             vi.unstubAllEnvs();
@@ -1217,10 +1230,10 @@ describe('standalone About images at explicit use boundaries', () => {
                 assertImage(support, 'support');expect(decode).toHaveBeenCalledTimes(2);
                 expect(chunk.code).not.toContain(expectedUrl('support'));
                 expect(chunk.code).not.toContain(expectedUrl('contact'));
-                expect(chunk.moduleIds).not.toContain(resolve(root, 'src/app/options/assets/wechat-contact.jpg'));
+                expect(chunk.moduleIds).not.toContain(viteModuleId(resolve(root, 'src/app/options/assets/wechat-contact.jpg')));
             } else {
                 expect(support).toBe(normalUrl);expect(decode).not.toHaveBeenCalled();
-                expect(chunk.moduleIds).toContain(resolve(root, 'src/app/options/assets/wechat-contact.jpg'));
+                expect(chunk.moduleIds).toContain(viteModuleId(resolve(root, 'src/app/options/assets/wechat-contact.jpg')));
             }
             api.getSupportImageUrl('other-normal-url');api.getContactImageUrl();
             expect(decode).toHaveBeenCalledTimes(enabled ? 2 : 0);
@@ -1406,8 +1419,8 @@ describe('standalone service brand paths at actual icon use', () => {
             if (!('output' in outputs[0]) || outputs[0].output.length !== 1 || outputs[0].output[0].type !== 'chunk') throw new Error('Expected actual complete brand owner chunk');
             const chunk = outputs[0].output[0];
             expect(chunk.imports).toEqual([]);expect(chunk.dynamicImports).toEqual([]);
-            expect(chunk.moduleIds).toContain(helperId);
-            expect(chunk.moduleIds.includes(dataPath)).toBe(!enabled);
+            expect(chunk.moduleIds).toContain(viteModuleId(helperId));
+            expect(chunk.moduleIds.includes(viteModuleId(dataPath))).toBe(!enabled);
             const decode = vi.fn(atob), parse = vi.fn(JSON.parse), hostData = {controlledHostData: true};
             const realm = {serviceBrandOwner: undefined as BrandApi | undefined, atob: decode, Uint8Array, ArrayBuffer, JSON: {parse}, controlledHostData: hostData};
             runInNewContext(chunk.code, realm, {timeout: 5_000});

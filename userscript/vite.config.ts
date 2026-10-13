@@ -126,7 +126,8 @@ export function createUserscriptCatalogCompressionPlugin(): Plugin {
         enforce: 'pre',
         resolveId(source, importer) {
             if (source === './messages/zh-CN'
-                && importer?.split('?')[0] === resolve(root, 'src/core/i18n/index.ts')) return externalChineseMessagesId;
+                && importer && normalizePath(importer.split('?')[0])
+                    === normalizePath(resolve(root, 'src/core/i18n/index.ts'))) return externalChineseMessagesId;
             if (!importer || !source.endsWith('.json')) return null;
             const sourcePath = resolve(dirname(importer.split('?')[0]), source);
             // 以 .js 结尾，避免 Vite 的 JSON 插件再次尝试解析虚拟模块源码。
@@ -312,7 +313,8 @@ type BrowserGlobal = 'browser' | 'chrome';
 export function findFreeBrowserGlobals(code: string, id: string): BrowserGlobal[] {
     // 没有候选时不建立编译器 program；反斜杠保留 Unicode 转义标识符的完整解析路径。
     if (!code.includes('browser') && !code.includes('chrome') && !code.includes('\\')) return [];
-    const sourceFile = ts.createSourceFile(id, code, ts.ScriptTarget.Latest, true);
+    const sourceId = normalizePath(id);
+    const sourceFile = ts.createSourceFile(sourceId, code, ts.ScriptTarget.Latest, true);
     const options: ts.CompilerOptions = {
         allowJs: true,
         module: ts.ModuleKind.ESNext,
@@ -321,17 +323,17 @@ export function findFreeBrowserGlobals(code: string, id: string): BrowserGlobal[
         target: ts.ScriptTarget.Latest,
     };
     const host: ts.CompilerHost = {
-        fileExists: (fileName) => fileName === id,
+        fileExists: (fileName) => fileName === sourceId,
         getCanonicalFileName: (fileName) => fileName,
         getCurrentDirectory: () => root,
         getDefaultLibFileName: () => '',
         getNewLine: () => '\n',
-        getSourceFile: (fileName) => fileName === id ? sourceFile : undefined,
-        readFile: (fileName) => fileName === id ? code : undefined,
+        getSourceFile: (fileName) => fileName === sourceId ? sourceFile : undefined,
+        readFile: (fileName) => fileName === sourceId ? code : undefined,
         useCaseSensitiveFileNames: () => true,
         writeFile: () => undefined,
     };
-    const checker = ts.createProgram([id], options, host).getTypeChecker();
+    const checker = ts.createProgram([sourceId], options, host).getTypeChecker();
     const found = new Set<BrowserGlobal>();
     const visit = (node: ts.Node): void => {
         if (ts.isIdentifier(node) && (node.text === 'browser' || node.text === 'chrome')) {
@@ -402,7 +404,7 @@ function bundleUserscriptCss(): Plugin {
           order: 'post',
           async handler(_options, bundle) {
             // 个人校订需要扩展后台作为唯一写入者；public 别名之外的直接导入也必须在构建期阻止。
-            const correctionFeatureRoot = `${resolve(root, 'src/features/personal-corrections')}/`;
+            const correctionFeatureRoot = `${normalizePath(resolve(root, 'src/features/personal-corrections'))}/`;
             const leakedCorrectionModule = Object.values(bundle)
                 .filter((item) => item.type === 'chunk')
                 .flatMap((item) => item.moduleIds)
