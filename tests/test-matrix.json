@@ -445,6 +445,7 @@
       "tests/documentationToolContracts.test.ts",
       "tests/translationCenterComponent.test.ts",
       "tests/resourceSafeRunner.test.ts",
+      "tests/firefoxPrivateRelease.test.ts",
       "tests/settingsCompositionAutosave.test.ts",
       "tests/chineseTranslationProviders.test.ts",
       "tests/cloudVendorProviders.test.ts",

@@ -56,3 +56,30 @@
 - `pnpm test:regression:all` 执行确定性的一键回归。真实浏览器层必须显式开启，使用临时 profile、屏幕外正常尺寸窗口和 focus-safe helper；不得连接用户日常 profile、最小化窗口或调用 `bringToFront()`。
 - 自动化按键名称使用标准 `Control`，不要使用 `CTRL`；浏览器报告必须说明 launch mode、focus policy、window placement、执行范围与证据目录。
 - 不把参考项目自身的测试通过视为 FluentRead 的验证结果。
+
+## 개인 Firefox fork 운영
+
+- 이 fork의 개인 사용 대상은 Firefox입니다. 현재 작업은 Windows 빌드 오류 두 곳과 개인 패키징입니다. 번역 로직은 업스트림 그대로 유지합니다. 이 범위에서는 Chrome/userscript 빌드와 웹사이트 문서 빌드를 요구하지 않습니다.
+- `origin`은 `euntaek-hong/FluentRead`, `upstream`은 `FluentRead/FluentRead`입니다. `main`은 업스트림을 따라가고 개인 수정은 `codex/firefox-local`에서 관리합니다. 업스트림 PR이나 정기 자동 업데이트는 만들지 않습니다.
+- 프로젝트 명령은 `npx --yes pnpm@9.12.1 <명령>`으로 실행할 수 있습니다. pnpm 전역 설치나 의존성 업그레이드는 필요하지 않습니다.
+- Windows 확장 전용 설치에서 문서용 이미지 바이너리 설치가 실패하면 `install --frozen-lockfile --ignore-scripts`를 사용합니다. 이후 `node node_modules/esbuild/install.js`와 `exec wxt prepare`를 실행합니다. TLS 검사를 완화하지 않습니다.
+
+### 업데이트 요청 시 체크리스트
+
+1. `git status --short`로 사용자 변경을 확인합니다. 작업 내용을 덮어쓰지 않고 `git fetch upstream`을 실행합니다.
+2. `scripts/firefox/maintenance.json`의 마지막 업스트림 커밋 이후 변경을 확인합니다. 검사 대상은 아래 두 동작입니다. 단순 문자열 검색으로 해결 여부를 판단하지 않습니다.
+   - `scripts/testing/run-resource-safe.mjs`: Windows에서 `shell:false`로 로컬 Node CLI를 실행해야 합니다. `wxt`, `vitest`, `vue-tsc`가 성공해야 하고 인수와 종료 코드가 보존되어야 합니다.
+   - `wxt.config.ts`의 `build:publicAssets`: WXT가 `/` 또는 `\\` 구분자로 제공하는 OCR core/worker를 모두 찾아야 합니다. 실제 리소스가 없으면 오류를 유지해야 합니다.
+3. 업스트림에서 해결된 패치는 회귀 테스트로 확인한 후 개인 브랜치에서 제거합니다. 커밋 제목은 `fix: execute local Node CLIs directly on Windows`, `fix: normalize OCR public asset paths on Windows`입니다. 같은 방식으로 해결하지 않았어도 동작이 맞으면 로컬 패치를 유지할 이유가 없습니다.
+4. `main`을 업스트림 기본 브랜치로 fast-forward합니다. 개인 브랜치를 갱신된 `main` 위로 rebase합니다. 개인 fork origin에만 반영합니다. 충돌은 변경 의도와 회귀 테스트를 기준으로 해결합니다.
+5. `firefox:check`를 실행합니다. 업스트림 커밋과 남은 패치를 `scripts/firefox/maintenance.json`에 기록합니다. 개인 배포 버전을 `scripts/firefox/release.config.json`에서 증가시키고 소스 변경을 커밋합니다.
+6. `firefox:package`, `firefox:sign`을 순서대로 실행합니다. 산출물은 `.output/firefox-private/<개인 버전>/`에 저장됩니다. `release.json`에 원본 버전과 소스/upstream 커밋, 해시와 제출 상태가 기록됩니다.
+
+### 개인 서명과 설치
+
+- 개인 ID는 `fluent-read@euntaek-hong`, 이름은 `FluentRead Personal`입니다. 원본 Firefox manifest는 유지하고 서명용 staging 복사본만 변경합니다. 개인 버전은 `1.0.1`부터 단조 증가합니다. 업스트림 package 버전은 수정하지 않습니다.
+- 인증정보 우선순위는 `WEB_EXT_API_KEY`/`WEB_EXT_API_SECRET` 환경변수, Git 제외 파일 `.env.signing.local`, 기존 `~/OneDrive/archive/settings/firefox/mozilla-api.json`의 `issuer`/`secret`입니다. 공유 JSON 경로는 `FLUENTREAD_AMO_CREDENTIAL_FILE`로 변경할 수 있습니다. 비밀값을 출력하거나 소스 ZIP에 넣지 않습니다.
+- 고정된 `web-ext@10.7.0`을 npm 임시 실행으로 사용합니다. 채널은 `unlisted`입니다. 재현 명령을 포함한 소스 ZIP을 함께 제출합니다.
+- 서명 대기/시간 초과 후에는 `firefox:sign -- --resume`으로 기존 제출건을 조회합니다. `submitting`, `pending`, `signed` 상태인 버전을 다시 패키징하거나 중복 제출하지 않습니다. 실패한 제출은 AMO에서 상태를 확인하고, 새 소스가 필요하면 개인 버전을 증가시킵니다.
+- `.output`을 정리하기 전에 배포별 `release.json`과 ZIP/XPI를 보존합니다. 이 기록은 업스트림 업데이트를 위한 Git 재작성과 독립적으로 유지합니다.
+- 서명된 XPI를 일반 Firefox의 파일에서 부가 기능 설치 메뉴로 설치합니다. 같은 개인 ID의 새 버전은 기존 설정을 유지합니다. 최종 확인은 Firefox 재시작 후 확장 활성화와 설정 유지입니다.

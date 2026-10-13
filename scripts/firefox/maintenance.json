@@ -1,0 +1,8 @@
+{
+  "upstreamCommit": "3711da1072c33b54f88130bef606f25e7d51277e",
+  "privateBranch": "codex/firefox-local",
+  "patches": [
+    {"commit": "5a7bbbba", "issue": "Windows local Node CLI execution", "status": "local"},
+    {"commit": "2f392d37", "issue": "Windows OCR public asset separators", "status": "local"}
+  ]
+}
