@@ -1,10 +1,10 @@
 /**
  * @file src/app/translation/check.ts
  * 文件职责：在内容侧翻译调用前执行最小配置可用性检查，并对模型输出做统一后处理，向页面用户反馈可操作错误。
- * 主要内容：根据服务类型验证自定义模型和必需模型选择，使用 page-notice 发送中文提示，在翻译请求发出前拦截不可用的服务与显示模式组合。
+ * 主要内容：根据服务类型验证自定义模型和必需模型选择，使用 page-notice 发送中文提示；Google 文本数组接口同时允许仅译文和双语渲染，不再沿用网页挂件的显示限制。
  * 模块边界：本文件不验证受保护凭据、不发起请求，也不决定 provider endpoint；可信凭据检查在后台或 extension page，网络与重试由 translation/client 负责。
  */
-import {customModelString, services, servicesType} from '@/src/core/config/catalog';
+import {customModelString, servicesType} from '@/src/core/config/catalog';
 import {config} from '@/src/services/config/store';
 import {sendErrorMessage} from '@/src/features/page-notice/public';
 
@@ -33,14 +33,6 @@ export function checkConfig(options: TranslationConfigCheckOptions = {}): boolea
             sendErrorMessage("模型尚未配置，请前往设置页配置");
             return false;
         }
-    }
-
-    // 部分翻译服务要求启用“双语模式”。
-    const displayMode = options.displayMode
-        ?? (config.display === 0 ? 'single' : 'bilingual');
-    if (displayMode === 'single' && service === services.google) {
-        sendErrorMessage("「谷歌翻译」仅支持双语模式，请切换翻译服务");
-        return false;
     }
 
     return true;

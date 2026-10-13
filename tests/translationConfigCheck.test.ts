@@ -56,12 +56,12 @@ describe('translation configuration guard', () => {
         expect(checkConfig()).toBe(true);
     });
 
-    it('谷歌翻译在仅译文模式下拒绝并说明原因', () => {
+    it('Google 文本接口允许仅译文模式且不显示旧挂件限制提示', () => {
         mocks.config.service = 'google';
         mocks.config.display = 0;
 
-        expect(checkConfig()).toBe(false);
-        expect(mocks.sendErrorMessage).toHaveBeenCalledWith('「谷歌翻译」仅支持双语模式，请切换翻译服务');
+        expect(checkConfig()).toBe(true);
+        expect(mocks.sendErrorMessage).not.toHaveBeenCalled();
     });
 
     it('快捷方案按本次服务、模型和显示方式校验，不被全局默认值误拦截', () => {
@@ -74,7 +74,7 @@ describe('translation configuration guard', () => {
 
         mocks.config.service = 'plain';
         mocks.config.display = 1;
-        expect(checkConfig({service: 'google', displayMode: 'single'})).toBe(false);
+        expect(checkConfig({service: 'google', displayMode: 'single'})).toBe(true);
         expect(checkConfig({service: 'google', displayMode: 'bilingual'})).toBe(true);
     });
 

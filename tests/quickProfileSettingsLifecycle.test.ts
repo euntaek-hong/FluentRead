@@ -133,8 +133,16 @@ describe('实际快捷方案缓存模板与最新草稿',()=>{
   it('移除自定义服务后拒绝旧选择，保留旧选择显示并允许恢复继承',async()=>{
     const cfg=runtime.reactive(new Config());cfg.customOpenAIProviders=[{id:'custom:local',name:'Local',endpoint:'http://localhost/v1',models:['private-model']}];await mountQuick(cfg,[p({service:'custom:local',model:'private-model'})]);await expand();const old=eventOf(control('service')),model=eventOf(control('model'));cfg.customOpenAIProviders=[];await settle();expect(card().classList.contains('is-unavailable')).toBe(true);old('custom:local');model('private-model');expect(updates).not.toHaveBeenCalled();eventOf(control('service'))('');expect(latest()[0]).toMatchObject({service:'',model:''})
   })
-  it('Google 仅限制当次控件显示，不能覆盖保存的显示偏好',async()=>{
-    await mountQuick(undefined,[p({displayMode:'translation-only'})]);await expand();const old=eventOf(control('display'));eventOf(control('service'))('google');await settle();for(const v of ['inherit','bilingual','translation-only'])eventOf(control('display'))(v);old('bilingual');expect(latest()[0].displayMode).toBe('translation-only');eventOf(control('service'))('microsoft');await settle();expect(control('display').getAttribute('data-model-value')).toBe('translation-only')
+  it('Google 允许编辑所有显示方式，旧服务事件仍不能覆盖新偏好',async()=>{
+    await mountQuick(undefined,[p({displayMode:'translation-only'})]);await expand()
+    const old=eventOf(control('display'));eventOf(control('service'))('google');await settle()
+    expect(control('display').hasAttribute('disabled')).toBe(false)
+    expect(control('display').getAttribute('data-model-value')).toBe('translation-only')
+    for(const value of ['inherit','bilingual','translation-only']) {
+      eventOf(control('display'))(value);await settle();expect(latest()[0].displayMode).toBe(value)
+    }
+    old('bilingual');expect(latest()[0].displayMode).toBe('translation-only')
+    eventOf(control('service'))('microsoft');await settle();expect(control('display').getAttribute('data-model-value')).toBe('translation-only')
   })
   it('术语只接受当前库，复制输入数组并保留继承、停用语义',async()=>{
     const cfg=runtime.reactive(new Config());cfg.glossaryEnabled=true;cfg.glossaryLibraries=[{id:'terms',name:'Terms',enabled:true,sourceLanguage:'',targetLanguage:'',domains:[],entries:[]}];await mountQuick(cfg);await expand();const port=()=>card().querySelector('.glossary-port')!;eventOf(port())(['gone']);eventOf(port())('terms');expect(updates).not.toHaveBeenCalled();const ids=['terms'];eventOf(port())(ids);ids.push('later');await settle();expect(latest()[0].glossaryIds).toEqual(['terms']);eventOf(port())([]);await settle();expect(latest()[0].glossaryIds).toEqual([]);eventOf(port())(null);expect(latest()[0].glossaryIds).toBeNull()

@@ -249,7 +249,7 @@ describe('快捷翻译调用解析', () => {
         expect(resolveQuickTranslationInvocation(profile(), config).scope).toBe('content');
     });
 
-    it('Google 只在当次执行时限制为双语，不覆盖方案保存的显示偏好', () => {
+    it('Google 原生文本接口遵循方案的仅译文显示偏好', () => {
         const selected = profile({
             service: services.google,
             displayMode: 'translation-only',
@@ -264,7 +264,7 @@ describe('快捷翻译调用解析', () => {
             translationScope: 'content',
         })).toMatchObject({
             service: services.google,
-            displayMode: 'bilingual',
+            displayMode: 'single',
         });
         expect(selected.displayMode).toBe('translation-only');
     });
