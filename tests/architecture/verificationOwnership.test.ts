@@ -136,6 +136,8 @@ function verificationOwners(path: string, strictCoverage: Set<string>): Verifica
     if (path.startsWith('scripts/testing/')
         || path.startsWith('scripts/agent-bridge/')
         || path.startsWith('scripts/wasm/')
+        // 私有 Firefox 打包/签名契约由 firefoxPrivateRelease.test.ts 验证。
+        || path === 'scripts/firefox/private-release.mjs'
         || PRODUCT_TOOL_SCRIPTS.includes(path)
         || DOCS_TOOL_SCRIPTS.includes(path)
         || path === 'scripts/generate-userscript-language-data.mjs'
