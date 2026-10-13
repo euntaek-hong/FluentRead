@@ -3019,9 +3019,79 @@ describe("全文翻译可见性锚点", () => {
             expect(runtime.requests).toHaveBeenCalledOnce();
             expect(runtime.requests).toHaveBeenCalledWith(['First', 'Second']);
             expect(runtime.requestOptions[0]).not.toHaveProperty('aiMultiSegment');
+            if (service === 'google') expect(runtime.requestOptions[0]).toMatchObject({flushNativePageBatch: true});
+            else expect(runtime.requestOptions[0]).not.toHaveProperty('flushNativePageBatch');
         },
     );
 
+    it('Google 全文原生跨候选请求以 32 个文本槽为上限，并把页面波次标记交给 provider', async () => {
+        runtime.nativeBatchEnabled = true;
+        const session = {active: true, translationSlotCache: new Map()};
+        const snapshot = translationSnapshot({service: 'google', enableAIMultiSegment: false});
+        const origins = Array.from({length: 33}, (_, index) => `Google slot ${index}`);
+        await expect(Promise.all(origins.map(origin =>
+            translateTextSlots([origin], snapshot, undefined, undefined, session),
+        ))).resolves.toEqual(origins.map(origin => [`译:${origin}`]));
+        expect(runtime.requests.mock.calls.map(([texts]) => texts)).toEqual([origins.slice(0, 32), origins.slice(32)]);
+        expect(runtime.requestOptions).toEqual([
+            expect.objectContaining({flushNativePageBatch: true}),
+            expect.objectContaining({flushNativePageBatch: true}),
+        ]);
+    });
+
+    it('Google 全文原生跨候选队列按转义后的 10,000 字符边界分开', async () => {
+        runtime.nativeBatchEnabled = true;
+        const session = {active: true, translationSlotCache: new Map()};
+        const snapshot = translationSnapshot({service: 'google', enableAIMultiSegment: false});
+        const origins = ['&'.repeat(2_000), '&'.repeat(2_000)];
+        await expect(Promise.all(origins.map(origin =>
+            translateTextSlots([origin], snapshot, undefined, undefined, session),
+        ))).resolves.toEqual(origins.map(origin => [`译:${origin}`]));
+        expect(runtime.requests.mock.calls.map(([texts]) => texts)).toEqual([[origins[0]], [origins[1]]]);
+    });
+
+    it('Google 原生正文请求不因标题翻译改写而失去会话内在途复用', async () => {
+        runtime.nativeBatchEnabled = true;
+        const response = deferred<string[]>();
+        runtime.requests.mockReturnValue(response.promise);
+        const session = {active: true, translationSlotCache: new Map(), ...createFullPageRequestSessionState()};
+        const snapshot = translationSnapshot({service: 'google', enableAIMultiSegment: false});
+        const first = translateTextSlots(['Stable body source'], snapshot, undefined, undefined, session);
+        await Promise.resolve();
+        document.title = 'Translated tab title';
+        const second = translateTextSlots(['Stable body source'], snapshot, undefined, undefined, session);
+        await waitForRequestCount(1);
+        expect(runtime.requests).toHaveBeenCalledOnce();
+        response.resolve(['译:Stable body source']);
+        await expect(Promise.all([first, second])).resolves.toEqual([
+            ['译:Stable body source'], ['译:Stable body source'],
+        ]);
+    });
+
+    it.each(['google', 'microsoft', 'ai'] as const)(
+        '%s 非原生页面请求在标题变化后保持不同的会话请求身份', async service => {
+            runtime.nativeBatchEnabled = true;
+            const firstResponse = deferred<string[]>();
+            const secondResponse = deferred<string[]>();
+            runtime.requests
+                .mockReturnValueOnce(firstResponse.promise)
+                .mockReturnValueOnce(secondResponse.promise);
+            const session = {active: true, translationSlotCache: new Map(), ...createFullPageRequestSessionState(),
+                allowNativeBatch: false};
+            const snapshot = translationSnapshot({service, enableNativeBatch: false, enableAIMultiSegment: false});
+            const first = translateTextSlots(['Title-sensitive body'], snapshot, undefined, undefined, session);
+            await Promise.resolve();
+            document.title = 'A different translated title';
+            const second = translateTextSlots(['Title-sensitive body'], snapshot, undefined, undefined, session);
+            await waitForRequestCount(2);
+            expect(session.translationRequestCache?.size).toBe(2);
+            firstResponse.resolve(['译:Title-sensitive body']);
+            secondResponse.resolve(['译:Title-sensitive body']);
+            await expect(Promise.all([first, second])).resolves.toEqual([
+                ['译:Title-sensitive body'], ['译:Title-sensitive body'],
+            ]);
+        },
+    );
     it.each(['google', 'microsoft', 'deepL', 'azureTranslator', 'googleCloudTranslation'])(
         '%s 原生关闭后不跨候选合批，AI 多段开启也不能绕过', async service => {
             runtime.nativeBatchEnabled = true;
@@ -3076,6 +3146,87 @@ describe("全文翻译可见性锚点", () => {
         expect(runtime.requestOptions[0]).not.toHaveProperty('aiMultiSegment');
     });
 
+    it('Google viewport 在不写远处 DOM 的前提下预准备二十个可见候选，DOM 生命周期仍受十个并发槽限制', async () => {
+        runtime.nativeBatchEnabled = true;
+        runtime.config.service = 'google';
+        runtime.config.fullPageTranslationMode = 'viewport';
+        runtime.config.maxConcurrentTranslations = 10;
+        document.body.innerHTML = Array.from({length: 20}, (_, index) =>
+            `<p data-prepare="${index}">Prepared viewport paragraph ${index}.</p>`,
+        ).join('') + '<p id="far">Far paragraph must not be requested.</p>';
+        const visible = Array.from(document.querySelectorAll<HTMLElement>('[data-prepare]'));
+        const far = document.querySelector<HTMLElement>('#far')!;
+        visible.forEach(owner => setLayoutBox(owner, 600, 60));
+        setLayoutBox(far, 600, 60);
+        Object.defineProperty(far, 'getBoundingClientRect', {configurable: true,
+            value: () => ({left: 0, top: 100_000, right: 600, bottom: 100_060, width: 600, height: 60})});
+        runtime.candidates = [...visible, far].map(element => ({element, kind: 'content', reason: 'google-prepare'}));
+        const release = deferred<void>();
+        runtime.requests.mockImplementation(origins => release.promise.then(() => origins.map(origin => `译:${origin}`)));
+
+        autoTranslateEnglishPage();
+        await vi.advanceTimersByTimeAsync(50);
+        visible.forEach(owner => TestIntersectionObserver.instances[0]!.emit(owner, true));
+        await waitForRequestCount(1);
+        expect(runtime.requests.mock.calls[0]![0]).not.toContain('Far paragraph must not be requested.');
+        expect(runtime.requests.mock.calls[0]![0]).toHaveLength(20);
+        const loadingOwners = visible.filter(owner => getTranslationState(owner)?.phase === 'loading');
+        expect(loadingOwners.length).toBeGreaterThan(0);
+        expect(loadingOwners.length).toBeLessThanOrEqual(10);
+        expect(far.querySelector('[data-fr-translation-owned="true"]')).toBeNull();
+
+        // 멀리 점프한 마지막 문단은 아직 DOM lifecycle에 소비되지 않았다. 그 preprepare를
+        // 취소해도 같은 Google request의 다른 후보는 계속 완료해야 한다.
+        const departed = visible.at(-1)!;
+        expect(getTranslationState(departed)).toBeUndefined();
+        Object.defineProperty(departed, 'getBoundingClientRect', {configurable: true,
+            value: () => ({left: 0, top: 100_000, right: 600, bottom: 100_060, width: 600, height: 60})});
+        TestIntersectionObserver.instances[0]!.emit(departed, false);
+        expect(getTranslationState(departed)).toBeUndefined();
+
+        release.resolve();
+        // 전체 요청 cache의 250ms 재마운트 유예가 끝난 뒤에도, 각 slot의 settled cache가
+        // 늦게 DOM lifecycle에 들어온 후보를 재요청 없이 소비한다.
+        await vi.advanceTimersByTimeAsync(300);
+        await finishScheduledWork();
+        expect(runtime.requests).toHaveBeenCalledOnce();
+        expect(visible.filter(owner => owner !== departed).every(owner => getTranslationState(owner)?.phase === 'translated')).toBe(true);
+        expect(getTranslationState(departed)).toBeUndefined();
+    });
+
+    it('Google viewport 路由重置释放旧预准备预算，新路线仍能一次准备完整首屏', async () => {
+        runtime.nativeBatchEnabled = true;
+        runtime.config.service = 'google';
+        runtime.config.fullPageTranslationMode = 'viewport';
+        runtime.config.maxConcurrentTranslations = 1;
+        document.body.innerHTML = Array.from({length: 32}, (_, index) =>
+            `<p data-route-prepare="${index}">Route preparation paragraph ${index}.</p>`,
+        ).join('');
+        const owners = Array.from(document.querySelectorAll<HTMLElement>('[data-route-prepare]'));
+        owners.forEach(owner => setLayoutBox(owner, 600, 60));
+        runtime.candidates = owners.map(element => ({element, kind: 'content', reason: 'google-route-prepare'}));
+        const oldResponse = deferred<string[]>();
+        const newResponse = deferred<string[]>();
+        runtime.requests
+            .mockReturnValueOnce(oldResponse.promise)
+            .mockReturnValueOnce(newResponse.promise);
+
+        autoTranslateEnglishPage();
+        await vi.advanceTimersByTimeAsync(50);
+        const observer = TestIntersectionObserver.instances.at(-1)!;
+        owners.forEach(owner => observer.emit(owner, true));
+        await waitForRequestCount(1);
+        expect(runtime.requests.mock.calls[0]![0]).toHaveLength(32);
+
+        resetFullPageTranslationRouteState();
+        await vi.advanceTimersByTimeAsync(50);
+        owners.forEach(owner => observer.emit(owner, true));
+        await waitForRequestCount(2);
+        expect(runtime.requests.mock.calls[1]![0]).toHaveLength(32);
+        oldResponse.resolve(owners.map(owner => `旧路线:${owner.textContent}`));
+        newResponse.resolve(owners.map(owner => `新路线:${owner.textContent}`));
+        await Promise.resolve();
+    });
     it.each(['microsoft', 'ai'])('微任务单候选 %s 冻结请求上下文，页面标题在 flush 前改变不污染旧请求', async service => {
         runtime.nativeBatchEnabled = true;
         const session = {active: true, translationSlotCache: new Map()};

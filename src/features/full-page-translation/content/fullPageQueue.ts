@@ -1,7 +1,7 @@
 /**
  * @file src/features/full-page-translation/content/fullPageQueue.ts
  * 文件职责：维护全文翻译 pending 候选的排队元数据，并选择当前最适合启动的候选。
- * 主要内容：保留同源候选的等待时间与稳定序号，显式失败重试去重入队并保留强制刷新意图，按 drain 批次集中读取锚点布局，共享锚点仅复用本次同步收集的成功有限读数，失败仍可重测、下一计划读取新布局；滚动期间仅派发可见候选，空闲时保持方向预取和后台公平配额。
+ * 主要内容：保留同源候选的等待时间与稳定序号，显式失败重试去重入队并保留强制刷新意图，按 drain 批次集中读取锚点布局并发布同一排序后的只读候选快照给无 DOM 预准备，共享锚点仅复用本次同步收集的成功有限读数，失败仍可重测、下一计划读取新布局；滚动期间仅派发可见候选，空闲时保持方向预取和后台公平配额。
  * 模块边界：本文件不发现候选、不修改 DOM、不调用 provider；runtime 负责生命周期与资格判断，fullPagePriority 负责纯排序规则。
  */
 
@@ -53,6 +53,8 @@ export interface FullPagePendingSelection {
 }
 
 export interface FullPageDispatchPlan {
+    /** 同一 drain 已测量并排序的只读候选快照；预准备不得消费 `next()`。 */
+    readonly candidates: readonly FullPagePendingSelection[];
     /** 取出下一个应启动的候选；同一计划内不再重新测量布局。 */
     next(): FullPagePendingSelection | undefined;
 }
@@ -240,6 +242,7 @@ export function createFullPageDispatchPlan(
     };
 
     return {
+        candidates: ordered,
         next(): FullPagePendingSelection | undefined {
             cursor = advance(ordered, cursor);
             if (cursor >= ordered.length) return undefined;

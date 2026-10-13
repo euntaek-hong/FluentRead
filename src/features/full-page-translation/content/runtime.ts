@@ -1,7 +1,7 @@
 /**
  * @file src/features/full-page-translation/content/runtime.ts
- * 文件职责：实现全文翻译的页面级会话引擎，负责候选发现、可见性调度、批量请求、动态 DOM 重扫、失败重试、缓存复用和恢复原文。
- * 主要内容：精确相同译文和有同目标语言证据的排版回显保留原文且不重复展示；以增量计数发布完成与失败摘要，仅对本会话失败目标重试和定位；维护 FullPageSession、AbortController、Intersection/Mutation 观察器、弹窗优先调度、精确属性写入过滤、候选所有权和生命周期重试；对变化来源等待安静窗口、跳过持续变化的计数，并清理延迟重扫，只有真实宿主删除启动候选回收，同批重复属性变化只处理一次；按时间片派发并在全文结果提交前让出主线程，合并同段 DOM 写入并在重挂时复用同批布局读数与单文本来源快照；合成行内段在延迟 loading 前后都按精确来源节点、HTML 和 Text 槽识别自身迁移；已拥有状态的发现候选直接登记复验，取消记录命中后才提取原文，避免整批重扫重复计算熔断签名；连续滚动时限频派发当前可见候选，空闲后恢复预取，按阅读进度撤回离开预取区的待派发候选，冻结请求/展示配置与识别范围，在弹窗关闭后继续正文，按实际节点阶段发布进度及工具栏结果；悬浮按候选停留而非每次移动计时，同段复用冻结的独立服务与快捷方案配置，到期复验最新命中并在路由切换取消；同目标预检单独读取受保护规则约束的行内代码语言上下文，发送与渲染仍只使用可翻译文本槽；恢复单个所有者或全文时重置篇章证据，统一恢复原文并清理重挂预算及孤儿产物；向局部翻译开放单候选 translateTarget 与单个译文所有者的恢复入口。
+ * 文件职责：实现全文翻译的页面级会话引擎，负责候选发现、可见性调度、Google viewport 无 DOM 预准备、批量请求、动态 DOM 重扫、失败重试、缓存复用和恢复原文。
+ * 主要内容：精确相同译文和有同目标语言证据的排版回显保留原文且不重复展示；以增量计数发布完成与失败摘要，仅对本会话失败目标重试和定位；维护 FullPageSession、AbortController、Intersection/Mutation 观察器、弹窗优先调度、精确属性写入过滤、候选所有权和生命周期重试；对变化来源等待安静窗口、跳过持续变化的计数，并清理延迟重扫，只有真实宿主删除启动候选回收，同批重复属性变化只处理一次；按时间片派发并在全文结果提交前让出主线程，合并同段 DOM 写入并在重挂时复用同批布局读数与单文本来源快照；Google viewport 仅从既有 IO pending 计划预准备有界请求，不创建 wrapper、spinner 或翻译状态；合成行内段在延迟 loading 前后都按精确来源节点、HTML 和 Text 槽识别自身迁移；已拥有状态的发现候选直接登记复验，取消记录命中后才提取原文，避免整批重扫重复计算熔断签名；连续滚动时限频派发当前可见候选，空闲后恢复预取，按阅读进度撤回离开预取区的待派发候选，冻结请求/展示配置与识别范围，在弹窗关闭后继续正文，按实际节点阶段发布进度及工具栏结果；悬浮按候选停留而非每次移动计时，同段复用冻结的独立服务与快捷方案配置，到期复验最新命中并在路由切换取消；同目标预检单独读取受保护规则约束的行内代码语言上下文，发送与渲染仍只使用可翻译文本槽；恢复单个所有者或全文时重置篇章证据，统一恢复原文并清理重挂预算及孤儿产物；向局部翻译开放单候选 translateTarget 与单个译文所有者的恢复入口。
  * 模块边界：这是 content 侧编排层，不实现 provider 协议、纯候选算法或底层状态存储；翻译调用经 app client，发现规则来自 core/translation，渲染与状态分别交给 renderer、liveTextRender 和 state。
  */
 import {resetPageDiscourseContext} from '@/src/services/translation/context/pageDiscourse';
@@ -33,6 +33,7 @@ import type {
     TranslationDiscoveryStep,
 } from "@/src/core/translation/public";
 import {shouldSkipTranslationForTarget} from '@/src/core/language/detect';
+import {services} from '@/src/core/config/catalog';
 import { config } from "@/src/services/config/store";
 import type { FullPageTranslationMode } from "@/src/core/config/model";
 import { consumeEagerTranslationBudget } from "@/src/features/full-page-translation/content/eagerTranslation";
@@ -191,6 +192,10 @@ interface FullPageSession extends FullPageRequestSessionState, ModalPrioritySess
      * 重新挂载同一段正文；此缓存避免生命周期抖动再次发出相同 provider 请求。
      */
     translationSlotCache: Map<string, FullPageTranslationCacheEntry>;
+    /** 尚未交给 DOM 生命周期消费的 Google viewport 请求预准备。 */
+    preparedCandidates: Map<Node, PreparedCandidate>;
+    preparedSlots: number;
+    preparedEscapedCharacters: number;
     draining: boolean;
     flushTimer: number | null;
     dirtyRoots: Set<Node>;
@@ -204,10 +209,22 @@ interface FullPageSession extends FullPageRequestSessionState, ModalPrioritySess
     statefulAttributeTimers: Map<HTMLElement, {timer: number; boundaryTimer?: number}>;
     statefulAttributeRescanTargets: WeakSet<HTMLElement>;
 }
+interface PreparedCandidate {
+    candidate: TranslationCandidate;
+    controller: AbortController;
+    source: string;
+    slots: number;
+    escapedCharacters: number;
+    settled: boolean;
+    consumed: boolean;
+}
 const BROAD_RESCAN_COOLDOWN_MS = 1_000;
 const CANDIDATE_PRUNE_BUDGET_MS = 4;
 const STATEFUL_ATTRIBUTE_DEBOUNCE_MS = 500;
 const FULL_PAGE_LIFECYCLE_RETRY_LIMIT = 2;
+const FULL_PAGE_PREPARE_MAX_TEXT_SLOTS = 32;
+const FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS = 10_000;
+const GOOGLE_HTML_WRAPPER_CHARACTERS = 11;
 
 const hoverTranslationScheduler = new HoverTranslationScheduler({
     isAvailable: () => document.visibilityState !== 'hidden' && config.on !== false,
@@ -718,8 +735,136 @@ function refreshCandidateVisibilityBinding(
     scheduleFullPageProgressPublish(session);
 }
 
+function googleEscapedTextLength(text: string): number {
+    return text.replace(/&/gu, '&amp;').replace(/</gu, '&lt;').replace(/>/gu, '&gt;')
+        .replace(/"/gu, '&quot;').replace(/'/gu, '&#39;').length + GOOGLE_HTML_WRAPPER_CHARACTERS;
+}
+
+function releasePreparedCandidate(session: FullPageSession, key: Node, entry: PreparedCandidate): void {
+    if (session.preparedCandidates.get(key) !== entry) return;
+    session.preparedCandidates.delete(key);
+    session.preparedSlots = Math.max(0, session.preparedSlots - entry.slots);
+    session.preparedEscapedCharacters = Math.max(0, session.preparedEscapedCharacters - entry.escapedCharacters);
+}
+
+function cancelPreparedCandidate(session: FullPageSession, candidate: TranslationCandidate): void {
+    const key = getTranslationCandidateKey(candidate);
+    const entry = session.preparedCandidates.get(key);
+    if (!entry) return;
+    releasePreparedCandidate(session, key, entry);
+    entry.controller.abort();
+}
+
+/** 未交给 DOM 消费的预准备归属旧路线时必须同步释放；旧 completion 不能释放同 key 的新条目。 */
+function clearPreparedCandidates(session: FullPageSession): void {
+    for (const [key, entry] of [...session.preparedCandidates]) {
+        releasePreparedCandidate(session, key, entry);
+        entry.controller.abort();
+    }
+    session.preparedSlots = 0;
+    session.preparedEscapedCharacters = 0;
+}
+
+function canPrepareGoogleCandidate(session: FullPageSession, candidate: TranslationCandidate): boolean {
+    return session.active
+        && session.translationMode === 'viewport'
+        && session.translationConfig.service === services.google
+        && session.translationConfig.enableNativeBatch !== false
+        && candidate.kind === 'content'
+        && !candidate.nodes?.length
+        && !candidate.visualRange
+        && !candidate.manualChunk
+        && candidate.element.isConnected
+        && !getTranslationState(candidate.element)
+        && candidateIsCurrent(candidate);
+}
+
+function prepareGoogleCandidate(session: FullPageSession, candidate: TranslationCandidate): void {
+    if (!canPrepareGoogleCandidate(session, candidate)) return;
+    const key = getTranslationCandidateKey(candidate);
+    const metadata = session.pendingMetadata.get(key);
+    // drain이 재시도 소유권과 실패 강제 재요청을 판정하기 전에는 네트워크를 시작하지 않는다.
+    // 실패 retry는 이전 오류 cache를 의도적으로 우회하므로 일반 preprepare와 공유할 수 없다.
+    if (metadata?.retryIsCurrent?.() === false || metadata?.forceFailedRequest === true) {
+        cancelPreparedCandidate(session, candidate);
+        return;
+    }
+    const core = getCurrentTranslationCore(candidate.scope);
+    const protectionOptions = getCandidateTranslationTextProtectionOptions(candidate);
+    const source = candidateSourceText(candidate, core, protectionOptions);
+    const existing = session.preparedCandidates.get(key);
+    if (existing) {
+        if (existing.source === source) return;
+        cancelPreparedCandidate(session, existing.candidate);
+    }
+    if (!normalizeComparableText(source)) return;
+    // translateTarget와 같은 자동 진입 문턱을 DOM 생성 전에 적용한다. 안정화 gate는
+    // 대기 timer를 등록할 수 있지만 provider, spinner, wrapper 또는 상태를 만들지 않는다.
+    if (translationSourceStability.blocks(candidate, source, session)) return;
+    if (session.translationConfig.displayMode === 'bilingual' && blocksBilingualRemountCandidate(
+        session.bilingualRemountCapitulations,
+        candidate.element,
+        source,
+        candidate.allowTopLevelApplicationShell === true,
+        getTranslationInvocationIdentity(session.translationConfig),
+        candidate.nodes,
+        candidate.scope,
+    )) return;
+    if (shouldSkipTranslationForTarget(
+        candidateSourceText(candidate, core, {...protectionOptions, includeInlineCodeForLanguage: true}),
+        session.translationConfig.targetLanguage,
+        session.translationConfig.excludedLanguages,
+    )) return;
+    const slots = collectLiveTranslationTextSlots(candidate.element, core.shouldStayOriginal, undefined, protectionOptions);
+    if (slots.length === 0) return;
+    const slotCount = slots.length;
+    const escapedCharacters = slots.reduce((total, slot) => total + googleEscapedTextLength(slot.source), 0);
+    const oversizedSingle = slotCount === 1 && escapedCharacters > FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS;
+    if (!oversizedSingle && (session.preparedSlots + slotCount > FULL_PAGE_PREPARE_MAX_TEXT_SLOTS
+        || session.preparedEscapedCharacters + escapedCharacters > FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS)) return;
+    if (oversizedSingle && session.preparedCandidates.size > 0) return;
+
+    const controller = new AbortController();
+    const entry: PreparedCandidate = {candidate, controller, source, slots: slotCount, escapedCharacters,
+        settled: false, consumed: false};
+    session.preparedCandidates.set(key, entry);
+    session.preparedSlots += slotCount;
+    session.preparedEscapedCharacters += escapedCharacters;
+    const request = createTranslationRequest(candidate.element, candidate.kind, session.translationConfig.displayMode,
+        session.translationConfig, controller.signal, createTranslationQueueSession(), session, protectionOptions,
+        false, candidate.scope);
+    void request.then(
+        () => {
+            entry.settled = true;
+            if (entry.consumed || session.scheduled.get(key) !== candidate) releasePreparedCandidate(session, key, entry);
+        },
+        () => releasePreparedCandidate(session, key, entry),
+    );
+}
+
+function prepareGoogleDispatchPlan(session: FullPageSession, plan: FullPageDispatchPlan, startedAt: number): void {
+    for (const {candidate} of plan.candidates) {
+        if (performance.now() - startedAt >= 8) break;
+        prepareGoogleCandidate(session, candidate);
+    }
+}
+
+function consumePreparedCandidate(session: FullPageSession | undefined, candidate: TranslationCandidate, source: string): void {
+    if (!session) return;
+    const key = getTranslationCandidateKey(candidate);
+    const entry = session.preparedCandidates.get(key);
+    if (!entry) return;
+    if (entry.source !== source || entry.candidate !== candidate) {
+        cancelPreparedCandidate(session, entry.candidate);
+        return;
+    }
+    entry.consumed = true;
+    if (entry.settled) releasePreparedCandidate(session, key, entry);
+}
+
 function forgetCandidate(session: FullPageSession | undefined, candidate: TranslationCandidate): void {
     if (!session) return;
+    cancelPreparedCandidate(session, candidate);
     const key = getTranslationCandidateKey(candidate);
     const removedPending = removeFullPagePending(session, key, candidate);
     if (session.scheduled.get(key) !== candidate) {
@@ -853,6 +998,7 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
             translationConfig.targetLanguage, translationConfig.excludedLanguages)) {
         return {status: "unchanged", source: sourceText};
     }
+    consumePreparedCandidate(statefulSession, candidate, sourceText);
 
     if (candidate.visualRange) {
         const visualCandidate = withFullPageViewportAnchor(
@@ -1098,9 +1244,12 @@ function drainFullPage(session: FullPageSession): void {
     // 有空闲槽时才集中测量锚点；一轮派发内复用，避免 loading 写入后重复读取布局。
     let plan: FullPageDispatchPlan | undefined;
     while (session.active && session.inFlightCandidates.size < maxConcurrent && session.pending.size > 0) {
-        plan ??= createFullPageDispatchPlan(session, {now: Date.now(), viewportHeight: window.innerHeight, visibleOnly: scrolling,
-            isEligible: candidate => !session.modal || isWithinTranslationModal(session.modal, candidate.element),
-            resolveSource: candidateLifecycleSource});
+        if (!plan) {
+            plan = createFullPageDispatchPlan(session, {now: Date.now(), viewportHeight: window.innerHeight, visibleOnly: scrolling,
+                isEligible: candidate => !session.modal || isWithinTranslationModal(session.modal, candidate.element),
+                resolveSource: candidateLifecycleSource});
+            prepareGoogleDispatchPlan(session, plan, startedAt);
+        }
         const selection = plan.next();
         if (!selection) break;
         const {key, candidate, priority} = selection;
@@ -1223,6 +1372,7 @@ function scheduleDiscoveredCandidate(session: FullPageSession, candidate: Transl
         }
         removeCandidateObservation(session, key);
         removeCandidateOwnerKey(session, existing.element, key);
+        cancelPreparedCandidate(session, existing);
         if (session.pending.has(key)) {
             queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
         }
@@ -1960,8 +2110,9 @@ function createFullPageSession(
                     queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
                 } else {
                     // 快速划过的内容退出预取区后继续观察，等再次进入时才派发。
-                    // 只撤回 pending，不取消在途请求，也不遗忘 scheduled 的候选所有权。
+                    // 已交给 DOM 的请求继续；尚未消费的预准备则撤销，立即归还 32 槽/10k 预算。
                     removeFullPagePending(session, key, candidate);
+                    if (!session.preparedCandidates.get(key)?.consumed) cancelPreparedCandidate(session, candidate);
                 }
             });
         }
@@ -2018,6 +2169,9 @@ function createFullPageSession(
         scrollController,
         bilingualRemountCapitulations: createBilingualRemountCapitulationRegistry(),
         translationSlotCache: new Map(),
+        preparedCandidates: new Map(),
+        preparedSlots: 0,
+        preparedEscapedCharacters: 0,
         ...createFullPageRequestSessionState(),
         draining: false,
         flushTimer: null,
@@ -2069,6 +2223,7 @@ function disposeFullPageSession(session: FullPageSession): void {
     session.inFlightCandidates.clear();
     session.userCancelledCandidates = new WeakMap();
     session.translationSlotCache.clear();
+    clearPreparedCandidates(session);
     session.dirtyRoots.clear();
     session.dirtyRootsBroadMode = false;
     session.activeDiscovery = null;
@@ -2092,6 +2247,7 @@ export function resetFullPageTranslationRouteState(): void {
     translationSourceStability.reset();
     hoverBilingualRemountCapitulations = createBilingualRemountCapitulationRegistry();
     invalidateHoverTranslationRequestSession();
+    if (fullPageSession?.active) clearPreparedCandidates(fullPageSession);
     resetFullPageRouteSession(fullPageSession, document.documentElement, {
         observe: observeFullPageRoot,
         rescan: enqueueFullPageRescan,
