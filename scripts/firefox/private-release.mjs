@@ -190,13 +190,17 @@ export async function verifySignedPayload(bytes, originalBytes, config) {
     }
 }
 
-async function downloadSigned(version, directory, record, config) {
+export async function downloadSigned(version, directory, record, config, auth) {
     if (version?.file?.status !== 'public' || !version.file.url) return false;
     const url = new URL(version.file.url);
     if (url.protocol !== 'https:' || !/(?:^|\.)mozilla\.(?:org|net)$/u.test(url.hostname)) {
         throw new Error('Unexpected AMO download origin');
     }
-    const response = await fetch(url, {signal: AbortSignal.timeout(60_000)});
+    // Unlisted downloads require the owner's JWT, like web-ext's submit-addon client.
+    // Restrict credentials to the exact AMO origin; fetch strips them on cross-origin redirects.
+    const headers = url.origin === 'https://addons.mozilla.org'
+        ? {Authorization: `JWT ${createJwt(auth.key, auth.secret)}`} : {};
+    const response = await fetch(url, {headers, signal: AbortSignal.timeout(60_000)});
     if (!response.ok) throw new Error(`XPI download failed (${response.status})`);
     const bytes = Buffer.from(await response.arrayBuffer());
     if (version.file.hash?.startsWith('sha256:') && digest(bytes) !== version.file.hash.slice(7)) throw new Error('AMO file hash mismatch');
@@ -241,7 +245,7 @@ export async function signRelease(config, resumeOnly, ports = {}) {
     const existing = await request(route, auth);
     if (existing) {
         if (existing.channel !== 'unlisted') throw new Error('Existing AMO version is not unlisted');
-        if (await download(existing, directory, record, config)) return;
+        if (await download(existing, directory, record, config, auth)) return;
         await save(recordPath, {...record, state: 'pending', amoVersionId: existing.id});
         console.log(`[firefox-private] AMO status: ${existing.file?.status}; run firefox:sign -- --resume later.`);
         return;
@@ -266,7 +270,7 @@ export async function signRelease(config, resumeOnly, ports = {}) {
     record = {...record, state: 'pending'};
     await save(recordPath, record);
     const submitted = await request(route, auth);
-    if (submitted && await download(submitted, directory, record, config)) return;
+    if (submitted && await download(submitted, directory, record, config, auth)) return;
     if (submitted) await save(recordPath, {...record, amoVersionId: submitted.id, amoStatus: submitted.file?.status});
     console.log('[firefox-private] Submission reserved. Resume with firefox:sign -- --resume; do not repackage this version.');
     if (failure) throw failure;

@@ -7,7 +7,7 @@ import {createHash, createHmac} from 'node:crypto';
 import JSZip from 'jszip';
 
 const moduleUrl = pathToFileURL(resolve('scripts/firefox/private-release.mjs')).href;
-const {overlayManifest, validateArchive, sanitizeSources, verifySignedPayload, createJwt, signRelease} =
+const {overlayManifest, validateArchive, sanitizeSources, verifySignedPayload, createJwt, signRelease, downloadSigned} =
     await import(/* @vite-ignore */ moduleUrl);
 const config = {id: 'fluent-read@euntaek-hong', name: 'FluentRead Personal', version: '1.0.1', webExtVersion: '10.7.0'};
 const original = {manifest_version: 2, name: '__MSG_extensionName__', version: '0.0.37', permissions: ['storage'],
@@ -78,6 +78,23 @@ describe('personal Firefox release', () => {
         expect(JSON.parse(Buffer.from(payload, 'base64url').toString())).toMatchObject({iss: 'fixture-issuer', iat: 12345, exp: 12405});
         expect(signature).toBe(createHmac('sha256', 'fixture-secret').update(`${header}.${payload}`).digest('base64url'));
         expect(createJwt('fixture-issuer', 'fixture-secret', 12345)).not.toBe(token);
+    });
+
+    it('非公开 XPI 下载使用 AMO 认证，并校验签名包内容和服务器摘要', async () => {
+        const directory = await mkdtemp(join(tmpdir(), 'fluentread-private-download-'));
+        temporary.push(directory);
+        const zip = await fixture();
+        const originalBytes = await zip.generateAsync({type: 'nodebuffer'});
+        await writeFile(join(directory, 'fluent-read-personal-1.0.1.zip'), originalBytes);
+        zip.file('META-INF/cose.sig', 'signature fixture');
+        const signed = await zip.generateAsync({type: 'nodebuffer'});
+        const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(new Uint8Array(signed)));
+        try {
+            const version = {id: 9, file: {status: 'public', url: 'https://addons.mozilla.org/firefox/downloads/file/fixture.xpi', hash: `sha256:${sha256(signed)}`}};
+            expect(await downloadSigned(version, directory, {}, config, {key: 'fixture', secret: 'fixture'})).toBe(true);
+            expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({Authorization: expect.stringMatching(/^JWT /)});
+            expect(JSON.parse(await readFile(join(directory, 'release.json'), 'utf8')).state).toBe('signed');
+        } finally {fetchMock.mockRestore();}
     });
 
     it('提交超时后重复调用只查询既有版本，不会再次上传', async () => {
