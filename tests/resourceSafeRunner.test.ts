@@ -4,7 +4,7 @@ import {mkdtemp, readdir, readFile, rm, mkdir, writeFile} from 'node:fs/promises
 import {tmpdir} from 'node:os';
 import {resolve, join} from 'node:path';
 import {pathToFileURL} from 'node:url';
-import {parseArgs} from '../scripts/testing/run-resource-safe.mjs';
+import {parseArgs, resolveNodeCommand} from '../scripts/testing/run-resource-safe.mjs';
 
 const runner = resolve('scripts/testing/run-resource-safe.mjs');
 const setupUrl = pathToFileURL(resolve('scripts/testing/vitest-resource-lock.mjs')).href;
@@ -62,6 +62,25 @@ afterEach(async () => {
 });
 
 describe('resource safe runner', () => {
+    it('Windows 本地 Node CLI 绕过 cmd shim，保留空格、特殊字符和退出码', async () => {
+        const directory = await workspace();
+        const packageRoot = join(directory, 'node_modules', 'fixture-cli');
+        await mkdir(join(packageRoot, 'bin with spaces'), {recursive: true});
+        await writeFile(join(directory, 'package.json'), JSON.stringify({devDependencies: {'fixture-cli': '1'}}));
+        await writeFile(join(packageRoot, 'package.json'), JSON.stringify({bin: {probe: 'bin with spaces/probe.mjs'}}));
+        await writeFile(join(packageRoot, 'bin with spaces/probe.mjs'),
+            '#!/usr/bin/env node\nconsole.log(JSON.stringify(process.argv.slice(2))); process.exit(7);\n');
+        const args = ['with spaces', '& echo should-stay-literal', '$HOME', '--'];
+        const invocation = await resolveNodeCommand('probe.cmd', args, 'win32', directory);
+        expect(invocation.command).toBe(process.execPath);
+        const result = await launch(directory, invocation.args).done;
+        expect(result.code).toBe(7);
+        expect(JSON.parse(result.stdout.trim())).toEqual(args);
+        expect(await resolveNodeCommand('probe', args, 'linux', directory)).toEqual({command: 'probe', args});
+        expect(await resolveNodeCommand(process.execPath, args, 'win32', directory))
+            .toEqual({command: process.execPath, args});
+    });
+
     it('只处理 Vitest 的首个转发分隔符，保留普通子命令参数与后续分隔符', () => {
         expect(parseCommand(['--', 'node', 'child.mjs', '--', '--literal']).args)
             .toEqual(['child.mjs', '--', '--literal']);
@@ -177,7 +196,8 @@ describe('resource safe runner', () => {
         expect((await launch(directory, [runner, '--', process.execPath, '-e', '']).done).code).toBe(0);
     });
 
-    it('SIGTERM 传给受控子进程，等待退出后释放锁', async () => {
+    // Windows kill() 强制终止进程，不会调用 JS SIGTERM handler；下面另测死进程锁回收。
+    it.runIf(process.platform !== 'win32')('SIGTERM 传给受控子进程，等待退出后释放锁', async () => {
         const directory = await workspace();
         const marker = join(directory, 'terminated');
         const code = `process.on('SIGTERM', () => {require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'yes'); process.exit(23)});
@@ -189,5 +209,20 @@ describe('resource safe runner', () => {
         expect((await job.done).code).toBe(23);
         expect(await readFile(marker, 'utf8')).toBe('yes');
         expect((await launch(directory, [runner, '--', process.execPath, '-e', '']).done).code).toBe(0);
+    });
+
+    it.runIf(process.platform === 'win32')('Windows 强制终止 runner 后回收死进程锁', async () => {
+        const directory = await workspace();
+        const job = launch(directory, [runner, '--', process.execPath, '-e',
+            "console.log('OWNED_PID=' + process.pid); setInterval(() => {}, 1000)"]);
+        await until(() => /^OWNED_PID=\d+$/mu.test(job.output()));
+        const childPid = Number(job.output().match(/^OWNED_PID=(\d+)$/mu)![1]);
+        try {
+            job.child.kill('SIGTERM');
+            await job.done;
+            expect((await launch(directory, [runner, '--', process.execPath, '-e', '']).done).code).toBe(0);
+        } finally {
+            try {process.kill(childPid);} catch { /* Child may already be gone. */ }
+        }
     });
 });

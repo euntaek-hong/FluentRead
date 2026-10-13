@@ -265,6 +265,38 @@ function signalProcessGroup(child, signal) {
     }
 }
 
+/** Windows 的 .cmd shim 不能由 shell:false 启动；从已安装依赖的 bin 元数据直接运行 Node CLI。 */
+export async function resolveNodeCommand(command, args, platform = process.platform, projectRoot = PROJECT_ROOT) {
+    if (platform !== 'win32' || /[\\/]/u.test(command)) return {command, args};
+    const name = command.replace(/\.cmd$/iu, '');
+    const project = JSON.parse(await readFile(path.join(projectRoot, 'package.json'), 'utf8'));
+    const packages = Object.keys({...project.dependencies, ...project.devDependencies});
+    for (const packageName of packages) {
+        const packageRoot = path.join(projectRoot, 'node_modules', packageName);
+        let metadata;
+        try {
+            metadata = JSON.parse(await readFile(path.join(packageRoot, 'package.json'), 'utf8'));
+        } catch (error) {
+            if (error.code === 'ENOENT') continue;
+            throw error;
+        }
+        const bins = typeof metadata.bin === 'string'
+            ? {[packageName.split('/').at(-1)]: metadata.bin} : metadata.bin || {};
+        if (!Object.hasOwn(bins, name)) continue;
+        const entry = path.resolve(packageRoot, bins[name]);
+        const source = await readFile(entry, 'utf8');
+        if (!/^#![^\r\n]*\bnode\b/u.test(source)) {
+            throw new Error(`Local CLI ${name} is not a Node executable`);
+        }
+        return {command: process.execPath, args: [entry, ...args]};
+    }
+    // pnpm is supplied by the invoking package manager, not a project dependency.
+    if (name === 'pnpm' && /(?:^|[\\/])pnpm\.(?:c?js|mjs)$/u.test(process.env.npm_execpath || '')) {
+        return {command: process.execPath, args: [process.env.npm_execpath, ...args]};
+    }
+    return {command, args};
+}
+
 async function runChild(options) {
     const env = {
         ...process.env,
@@ -276,9 +308,10 @@ async function runChild(options) {
         FLUENTREAD_TEST_CPU_TARGET: String(options.cpuTargetPercent),
         FLUENTREAD_TEST_MAX_WORKERS: String(options.maxWorkers),
     };
+    const invocation = await resolveNodeCommand(options.command, options.args);
     console.log(`[resource-safe] CPU target ${options.cpuTargetPercent}%, maxWorkers ${options.maxWorkers}, concurrency ${options.concurrency}, command: ${options.command} ${options.args.join(' ')}`);
     return new Promise((resolve, reject) => {
-        const child = spawn(options.command, options.args, {
+        const child = spawn(invocation.command, invocation.args, {
             cwd: PROJECT_ROOT,
             env,
             stdio: 'inherit',
