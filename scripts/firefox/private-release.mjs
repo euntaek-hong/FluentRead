@@ -5,7 +5,7 @@ import path from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {spawn, execFileSync} from 'node:child_process';
 import {createHash, createHmac, randomUUID} from 'node:crypto';
-import {parseEnv} from 'node:util';
+import {parseEnv, isDeepStrictEqual} from 'node:util';
 import {homedir} from 'node:os';
 import JSZip from 'jszip';
 
@@ -184,8 +184,16 @@ export async function verifySignedPayload(bytes, originalBytes, config) {
     const original = await JSZip.loadAsync(originalBytes, {checkCRC32: true});
     for (const [name, entry] of Object.entries(original.files)) {
         if (entry.dir) continue;
+        // AMO rewrites manifest JSON formatting when signing; all field values must stay identical.
+        if (name === 'manifest.json' && signed.file(name)
+            && isDeepStrictEqual(JSON.parse(await entry.async('string')), JSON.parse(await signed.file(name).async('string')))) continue;
         if (!signed.file(name) || digest(await entry.async('nodebuffer')) !== digest(await signed.file(name).async('nodebuffer'))) {
             throw new Error(`Signed payload differs from submitted package: ${name}`);
+        }
+    }
+    for (const entry of Object.values(signed.files)) {
+        if (!entry.dir && !original.file(entry.name) && !entry.name.startsWith('META-INF/')) {
+            throw new Error(`Unexpected file in signed package: ${entry.name}`);
         }
     }
 }

@@ -55,7 +55,12 @@ describe('personal Firefox release', () => {
         const zip = await fixture();
         const submitted = await zip.generateAsync({type: 'nodebuffer'});
         zip.file('META-INF/cose.sig', 'fixture signature, not cryptographic verification');
+        // AMO normalizes manifest whitespace while preserving parsed values.
+        zip.file('manifest.json', JSON.stringify(overlayManifest(original, config), null, 4));
         await expect(verifySignedPayload(await zip.generateAsync({type: 'nodebuffer'}), submitted, config)).resolves.toBeUndefined();
+        zip.file('manifest.json', JSON.stringify({...overlayManifest(original, config), permissions: ['storage', 'tabs']}));
+        await expect(verifySignedPayload(await zip.generateAsync({type: 'nodebuffer'}), submitted, config)).rejects.toThrow('manifest.json');
+        zip.file('manifest.json', JSON.stringify(overlayManifest(original, config)));
         zip.file('background.js', 'unexpected changed code');
         await expect(verifySignedPayload(await zip.generateAsync({type: 'nodebuffer'}), submitted, config)).rejects.toThrow('background.js');
     });
