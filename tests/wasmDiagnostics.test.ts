@@ -2,6 +2,7 @@ import {describe, expect, it, vi} from 'vitest';
 import {readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {runInNewContext} from 'node:vm';
 import {instrumentWasmDiagnostics, splitTesseractWasm, packageTesseractWasm} from '../scripts/wasm/package-diagnostics';
 
@@ -53,7 +54,7 @@ describe('packaged WASM diagnostic severity', () => {
             writeFileSync(join(root, 'scripts/wasm/diagnostics.js'), adapter);
             const source = new URL('../public/fluent-read-ocr/core/tesseract-core-simd-lstm.wasm.js', import.meta.url);
             const original = readFileSync(source, 'utf8');
-            const result = packageTesseractWasm(root, source.pathname);
+            const result = packageTesseractWasm(root, fileURLToPath(source));
             expect(readFileSync(result.wasm).equals(splitTesseractWasm(original).wasm)).toBe(true);
             expect(readFileSync(result.glue, 'utf8')).toContain('n=b.printErr||fluentReadWasmStderr');
             expect(readFileSync(source, 'utf8')).toBe(original);

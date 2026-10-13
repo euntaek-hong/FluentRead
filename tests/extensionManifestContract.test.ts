@@ -10,9 +10,28 @@ import {defineUnlistedScript} from 'wxt/utils/define-unlisted-script';
 import {createHash} from 'node:crypto';
 import {GOOGLE_DRIVE_DEFAULT_CLIENT_ID, GOOGLE_DRIVE_EXTENSION_ID, GOOGLE_DRIVE_EXTENSION_PUBLIC_KEY, GOOGLE_DRIVE_SCOPES} from '@/src/platform/google-drive/constants';
 import type {Entrypoint, EntrypointGroup} from 'wxt';
-import {remoteConfigStorageBuildPlugin, createExtensionManifest, extendRemoteConfigBuildConfig, groupModuleWorkers, prepareExtensionStoreZip} from '@/wxt.config';
+import {remoteConfigStorageBuildPlugin, createExtensionManifest, extendRemoteConfigBuildConfig, groupModuleWorkers, prepareExtensionStoreZip, requirePublicAsset} from '@/wxt.config';
 
 const PROJECT_ROOT = resolve(__dirname, '..');
+
+describe('Windows OCR public asset paths', () => {
+    it.each(['/', '\\'])('找到 %s 分隔的真实资源对象并保留原生源路径', separator => {
+        for (const [destination, label] of [
+            ['fluent-read-ocr/core/tesseract-core-simd-lstm.wasm.js', 'OCR core'],
+            ['fluent-read-ocr/worker/worker.min.js', 'OCR worker'],
+        ]) {
+            const asset = {relativeDest: destination.replaceAll('/', separator), absoluteSrc: 'C:\\with spaces\\asset.js'};
+            expect(requirePublicAsset([asset], destination, label)).toBe(asset);
+            expect(asset.absoluteSrc).toBe('C:\\with spaces\\asset.js');
+        }
+    });
+
+    it.each(['OCR core', 'OCR worker'])('缺少 %s 或没有源文件仍然中止构建', label => {
+        expect(() => requirePublicAsset([], 'missing.js', label)).toThrow(`Missing packaged ${label}`);
+        expect(() => requirePublicAsset([{relativeDest: 'missing.js'}], 'missing.js', label))
+            .toThrow(`Missing packaged ${label}`);
+    });
+});
 
 describe('Chrome store ZIP packaging', () => {
     async function fixture(manifest: Record<string, unknown>) {
@@ -383,11 +402,12 @@ describe('extension manifest capability contract', () => {
     it('网页及扩展 UI 构建组使用远程配置存储，后台和未知入口保留完整运行时', () => {
         const plugin = remoteConfigStorageBuildPlugin();
         expect(plugin.enforce).toBe('pre');
-        expect(plugin.resolveId(resolve(PROJECT_ROOT, 'src/platform/storage/configStorageRuntime')))
+        // Vite normalizes module IDs to forward slashes on every platform.
+        expect(plugin.resolveId(resolve(PROJECT_ROOT, 'src/platform/storage/configStorageRuntime').replaceAll('\\', '/')))
             .toBe(resolve(PROJECT_ROOT, 'src/platform/storage/remoteConfigStorageRuntime.ts'));
-        expect(plugin.resolveId(resolve(PROJECT_ROOT, 'src/platform/storage/configStorageRuntime.ts')))
+        expect(plugin.resolveId(resolve(PROJECT_ROOT, 'src/platform/storage/configStorageRuntime.ts').replaceAll('\\', '/')))
             .toBe(resolve(PROJECT_ROOT, 'src/platform/storage/remoteConfigStorageRuntime.ts'));
-        expect(plugin.resolveId(resolve(PROJECT_ROOT, 'src/platform/storage/configStorage.ts'))).toBeNull();
+        expect(plugin.resolveId(resolve(PROJECT_ROOT, 'src/platform/storage/configStorage.ts').replaceAll('\\', '/'))).toBeNull();
 
         const contentGroup: {plugins?: unknown[]} = {plugins: ['existing']};
         extendRemoteConfigBuildConfig([{type: 'content-script'}, {type: 'content-script'}], contentGroup);

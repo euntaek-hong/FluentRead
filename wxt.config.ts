@@ -20,6 +20,17 @@ const firefoxRunnerBinary = process.env.FLUENTREAD_FIREFOX_RUNNER_BINARY;
 const firefoxRunnerProfile = process.env.FLUENTREAD_FIREFOX_RUNNER_PROFILE;
 const firefoxRunnerStartUrl = process.env.FLUENTREAD_FIREFOX_RUNNER_START_URL;
 
+/** WXT 0.20 的 public 文件在 Windows 使用反斜线；比较资源 URL 时统一分隔符。 */
+export function requirePublicAsset<T extends {relativeDest: string}>(
+    files: T[], destination: string, label: string,
+): T & {absoluteSrc: string} {
+    const asset = files.find(file => file.relativeDest.replaceAll('\\', '/') === destination);
+    if (!asset || !('absoluteSrc' in asset) || typeof asset.absoluteSrc !== 'string') {
+        throw new Error(`Missing packaged ${label}`);
+    }
+    return asset as T & {absoluteSrc: string};
+}
+
 /** 仅商店 ZIP 移除开发用固定 ID；保留本地构建的 key、OAuth 和全部运行文件。 */
 export async function prepareExtensionStoreZip(browser: string, zipPath: string): Promise<void> {
     if (browser !== 'chrome') return;
@@ -284,13 +295,11 @@ export default defineConfig({
             files.push({absoluteSrc: packageWasmDiagnostics(__dirname, resolve(ortDist, 'ort-wasm-simd-threaded.asyncify.mjs'), 'ort-wasm-simd-threaded.asyncify.mjs', 'onnx'), relativeDest: 'fluent-read-ai/ort-wasm-simd-threaded.asyncify.mjs'});
             files.push({absoluteSrc: resolve(ortDist, 'ort-wasm-simd-threaded.asyncify.wasm'), relativeDest: 'fluent-read-ai/ort-wasm-simd-threaded.asyncify.wasm'});
             files.push({absoluteSrc: resolve(__dirname, 'node_modules/@wllama/wllama/esm/wasm/wllama.wasm'), relativeDest: 'fluent-read-ai/wllama.wasm'});
-            const ocrCore = files.find(file => file.relativeDest === 'fluent-read-ocr/core/tesseract-core-simd-lstm.wasm.js');
-            if (!ocrCore || !('absoluteSrc' in ocrCore)) throw new Error('Missing packaged OCR core');
+            const ocrCore = requirePublicAsset(files, 'fluent-read-ocr/core/tesseract-core-simd-lstm.wasm.js', 'OCR core');
             const packagedOcr = packageTesseractWasm(__dirname, ocrCore.absoluteSrc);
             ocrCore.absoluteSrc = packagedOcr.glue;
             files.push({absoluteSrc: packagedOcr.wasm, relativeDest: 'fluent-read-ocr/core/tesseract-core-simd-lstm.wasm'});
-            const ocrWorker = files.find(file => file.relativeDest === 'fluent-read-ocr/worker/worker.min.js');
-            if (!ocrWorker || !('absoluteSrc' in ocrWorker)) throw new Error('Missing packaged OCR worker');
+            const ocrWorker = requirePublicAsset(files, 'fluent-read-ocr/worker/worker.min.js', 'OCR worker');
             ocrWorker.absoluteSrc = packageTesseractWorker(__dirname, ocrWorker.absoluteSrc);
             files.push({absoluteSrc: resolve(__dirname, 'node_modules/tesseract.js/dist/worker.min.js.LICENSE.txt'), relativeDest: 'fluent-read-ocr/worker/worker.min.js.LICENSE.txt'});
             files.push({absoluteSrc: resolve(__dirname, 'node_modules/tesseract.js/LICENSE.md'), relativeDest: 'fluent-read-ocr/LICENSE.md'});
