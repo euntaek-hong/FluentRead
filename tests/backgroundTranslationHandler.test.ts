@@ -106,6 +106,17 @@ describe('background translation fallback handler', () => {
         }
     });
 
+    it('全文 Google 提前提交标记只接受内部显式布尔值', () => {
+        expect(parseTranslationRequest({origin: ['a', 'b'], flushNativePageBatch: true}))
+            .toEqual({origin: ['a', 'b'], flushNativePageBatch: true});
+        expect(parseTranslationRequest({origin: 'a', flushNativePageBatch: false}))
+            .toEqual({origin: 'a', flushNativePageBatch: false});
+        for (const value of ['true', null, 1, {}]) {
+            expect(() => parseTranslationRequest({origin: 'a', flushNativePageBatch: value}))
+                .toThrow('flushNativePageBatch');
+        }
+    });
+
     it('保留字符串数组并忽略未提供的可选字段', () => {
         expect(parseTranslationRequest({origin: ['a', 'b']})).toEqual({origin: ['a', 'b']});
         expect(parseTranslationRequest({origin: '', context: undefined})).toEqual({origin: ''});

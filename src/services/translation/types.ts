@@ -33,6 +33,8 @@ export interface TranslationRequestMessageBase {
     enableAIContext?: boolean;
     /** 请求入口冻结的原生合批偏好；缺省由后台当前服务配置解析。 */
     enableNativeBatch?: boolean;
+    /** 全文 Google 原生批次已完成当前页面波次收集，可跳过跨调用收集窗。 */
+    flushNativePageBatch?: boolean;
     useCache?: boolean;
     /** 全文翻译内部标记；仅允许通用提示词型 AI 把数组合并为一次上游请求。 */
     aiMultiSegment?: boolean;

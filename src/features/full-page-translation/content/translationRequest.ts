@@ -1,7 +1,7 @@
 /**
  * @file src/features/full-page-translation/content/translationRequest.ts
  * 文件职责：为单次全文翻译会话冻结请求配置，并执行文本槽的批量、原生数组和显式 AI 跨候选合并、分包、回退与会话级结果复用。
- * 主要内容：冻结调用时的长段落换行与译文位置，操作身份区分展示设置而 provider 结果键仍只包含请求维度；在调用入口复制原文与服务/模型/语言/术语/排除列表快照，先过滤排除语言的文本槽再合批；缺失条目携带同次复制快照生成的逐槽键，保持键维度、512 条容量与整请求取消归属，避免登记结果时重复序列化；在本地保留尚未排版的三美元公式源码，构造显式 client 参数，按服务选择批译策略；标记内部单条槽协议，由 broker 按冻结术语和同一截止时间逐槽校验；为本地模型只构造一次整段语言样本，为 Chrome auto 逐槽翻译保留无哨兵整段检测样本，按冻结服务偏好自动原生数组合批，关闭后保留逐项请求，完整结构校验后才分发，AI 只合并同父直接相邻候选并在协议失败后停用同快照合批，严格隔离取消归属并维护有界会话缓存。
+ * 主要内容：冻结调用时的长段落换行与译文位置，Google 原生正文批次以 32 槽和转义 HTML 10,000 字符为界且只在该无标题上下文路径复用会话请求，操作身份区分展示设置而 provider 结果键仍只包含请求维度；在调用入口复制原文与服务/模型/语言/术语/排除列表快照，先过滤排除语言的文本槽再合批；缺失条目携带同次复制快照生成的逐槽键，保持键维度、512 条容量与整请求取消归属，避免登记结果时重复序列化；在本地保留尚未排版的三美元公式源码，构造显式 client 参数，按服务选择批译策略；标记内部单条槽协议，由 broker 按冻结术语和同一截止时间逐槽校验；为本地模型只构造一次整段语言样本，为 Chrome auto 逐槽翻译保留无哨兵整段检测样本，按冻结服务偏好自动原生数组合批，关闭后保留逐项请求，完整结构校验后才分发，AI 只合并同父直接相邻候选并在协议失败后停用同快照合批，严格隔离取消归属并维护有界会话缓存。
  * 模块边界：本文件不发现候选、不持有 DOM 翻译状态也不渲染译文；runtime 提供会话缓存和取消作用域，client 负责后台协议与队列执行。
  */
 import {preparePageDiscourseContext} from '@/src/services/translation/context/pageDiscourse';
@@ -37,6 +37,9 @@ const FULL_PAGE_TRANSLATION_REQUEST_CACHE_LIMIT = 512;
 const FULL_PAGE_TRANSLATION_REMOUNT_GRACE_MS = 250;
 const CROSS_CANDIDATE_MAX_TEXT_SLOTS = 4;
 const CROSS_CANDIDATE_MAX_CHARACTERS = 2_000;
+const CROSS_CANDIDATE_NATIVE_GOOGLE_MAX_TEXT_SLOTS = 32;
+const CROSS_CANDIDATE_NATIVE_GOOGLE_MAX_ESCAPED_CHARACTERS = 10_000;
+const GOOGLE_HTML_WRAPPER_CHARACTERS = 11;
 // 悬浮手势的每次配置捕获仍同步冻结字段；只有全库摘要经原始标量复验后复用。
 const readGlossaryRevision = createGlossaryRevisionMemoizer();
 
@@ -74,6 +77,7 @@ type SnapshotTranslateExecutionOptions = Pick<
     TranslateOptions,
     'aiMultiSegment' | 'queueSession' | 'signal' | 'skipLanguageDetection'
     | 'sourceLanguageDetectionText' | 'useCache' | 'validateTranslationSlots' | 'discourseContext'
+    | 'flushNativePageBatch'
 >;
 
 export interface FullPageTranslationSessionCache {
@@ -104,6 +108,7 @@ interface TranslationBatchTask {
     snapshot: FullPageTranslationConfigSnapshot;
     signal?: AbortSignal;
     queueSession?: TranslationQueueSession;
+    flushNativePageBatch: boolean;
     settled: boolean;
     resolve: (translations: string[]) => void;
     reject: (error: unknown) => void;
@@ -303,6 +308,7 @@ function createCacheKey(origin: string, snapshot: FullPageTranslationConfigSnaps
 function createRequestCacheKey(
     origins: readonly string[],
     snapshot: FullPageTranslationConfigSnapshot,
+    requestContext: string,
     pageContextGeneration: number,
     aiBatchOwnerIdentity?: number,
     discourseContext?: string,
@@ -320,7 +326,9 @@ function createRequestCacheKey(
         enableAIContext: snapshot.enableAIContext,
         enableAIMultiSegment: snapshot.enableAIMultiSegment,
         enableNativeBatch: snapshot.enableNativeBatch !== false,
-        context: document.title,
+        // 只在全文 Google 原生数组批次省略标题：broker 不把它交给 Google provider。
+        // 其他路径保留标题，供 DeepL 和 AI 等上下文型服务区分请求身份。
+        context: requestContext,
         pageUrl: document.location?.href ?? document.URL ?? '',
         pageContextGeneration,
         aiBatchOwnerIdentity,
@@ -553,9 +561,21 @@ function createInvalidAIResponse(): Error {
     });
 }
 
+function isNativeGooglePageBatch(task: TranslationBatchTask): boolean {
+    return task.flushNativePageBatch && task.snapshot.service === services.google;
+}
+
+// Google provider 的 <pre>${escapeGoogleText(text)}</pre> 边界在此重复计算，
+// 让内容脚本待发队列有相同上限；provider 仍以实际编码后的长度完成最终分包。
+function googleEscapedTextLength(text: string): number {
+    return text.replace(/&/gu, '&amp;').replace(/</gu, '&lt;').replace(/>/gu, '&gt;')
+        .replace(/"/gu, '&quot;').replace(/'/gu, '&#39;').length + GOOGLE_HTML_WRAPPER_CHARACTERS;
+}
+
 function takeTranslationBatch(queue: TranslationBatchQueue): TranslationBatchTask[] {
     const batch: TranslationBatchTask[] = [];
     let characters = 0;
+    let googleEscapedCharacters = 0;
     let textSlots = 0;
     let snapshotKey = '';
     while (queue.pending.length > 0) {
@@ -566,6 +586,7 @@ function takeTranslationBatch(queue: TranslationBatchQueue): TranslationBatchTas
         }
         const nextSnapshotKey = next.batchKey;
         if (batch.length > 0 && nextSnapshotKey !== snapshotKey) break;
+        const nativeGooglePageBatch = isNativeGooglePageBatch(next);
         const previous = batch.at(-1);
         // 只有真实 DOM 相邻候选才共享 AI 上下文；数组接口的各项由 provider 独立翻译。
         if (previous && !supportsNativeTranslationBatch(next.snapshot.service)
@@ -573,16 +594,23 @@ function takeTranslationBatch(queue: TranslationBatchQueue): TranslationBatchTas
             && (!previous.owner || !next.owner || previous.owner.parentElement !== next.owner.parentElement
                 || next.owner.previousElementSibling !== previous.owner)) break;
         const nextCharacters = next.origins.reduce((total, origin) => total + (origin?.length ?? 0), 0);
+        const nextGoogleEscapedCharacters = next.origins
+            .reduce((total, origin) => total + googleEscapedTextLength(origin ?? ''), 0);
         const nextTextSlots = next.origins.length;
         if (batch.length > 0 && (
-            textSlots + nextTextSlots > CROSS_CANDIDATE_MAX_TEXT_SLOTS
-            || characters + nextCharacters > CROSS_CANDIDATE_MAX_CHARACTERS
+            textSlots + nextTextSlots > (nativeGooglePageBatch
+                ? CROSS_CANDIDATE_NATIVE_GOOGLE_MAX_TEXT_SLOTS
+                : CROSS_CANDIDATE_MAX_TEXT_SLOTS)
+            || (nativeGooglePageBatch
+                ? googleEscapedCharacters + nextGoogleEscapedCharacters > CROSS_CANDIDATE_NATIVE_GOOGLE_MAX_ESCAPED_CHARACTERS
+                : characters + nextCharacters > CROSS_CANDIDATE_MAX_CHARACTERS)
         )) break;
         queue.pending.shift();
         batch.push(next);
         snapshotKey = nextSnapshotKey;
         textSlots += nextTextSlots;
         characters += nextCharacters;
+        googleEscapedCharacters += nextGoogleEscapedCharacters;
     }
     return batch;
 }
@@ -626,6 +654,7 @@ async function executeTranslationBatch(tasks: TranslationBatchTask[], queue: Tra
                 () => queue.disabledAIKeys.add(task.aiCircuitKey),
                 task.context,
                 task.discourseContext,
+                task.flushNativePageBatch,
             ));
         } catch (error) {
             if (!native && shouldFallbackAITranslationBatch(error)) {
@@ -660,6 +689,7 @@ async function executeTranslationBatch(tasks: TranslationBatchTask[], queue: Tra
                 ...(native ? {} : {aiMultiSegment: true}),
                 signal: controller.signal,
                 queueSession: sharedQueueSession,
+                ...(activeTasks.every(task => task.flushNativePageBatch) ? {flushNativePageBatch: true} : {}),
             }),
         );
         const translations = native
@@ -707,6 +737,7 @@ function enqueueTranslationBatchTask(
     session: FullPageTranslationSessionCache,
     owner?: Element,
     discourseContext?: string,
+    flushNativePageBatch = false,
 ): Promise<string[]> {
     throwIfAborted(signal);
     let queue = translationBatchQueues.get(session);
@@ -726,6 +757,7 @@ function enqueueTranslationBatchTask(
             snapshot,
             signal,
             queueSession,
+            flushNativePageBatch,
             settled: false,
             resolve,
             reject,
@@ -773,6 +805,7 @@ async function translateTextSlotsDirectly(
     onSlotProtocolInvalid?: () => void,
     context = document.title,
     discourseContext?: string,
+    flushNativePageBatch = false,
 ): Promise<string[]> {
     throwIfAborted(signal);
     // 小模型直接翻译各槽，不要求模型复述结构标记；短链接借用段落正文检测语言。
@@ -785,7 +818,7 @@ async function translateTextSlotsDirectly(
         || (servicesType.isMachine(snapshot.service) && supportsTranslationBatch(snapshot.service));
     if (batchFriendly) {
         if (!fullPageSession?.active || fullPageSession.retainSettledResults === false) {
-            return translateArrayWithValidation(origins, snapshot, {useCache: false, signal, queueSession}, context, discourseContext);
+            return translateArrayWithValidation(origins, snapshot, {useCache: false, signal, queueSession, flushNativePageBatch}, context, discourseContext);
         }
 
         const resultPromises = new Array<Promise<string | undefined>>(origins.length);
@@ -810,7 +843,7 @@ async function translateTextSlotsDirectly(
             const providerRequest = translateArrayWithValidation(
                 entries.map(({origin}) => origin),
                 snapshot,
-                {signal, queueSession},
+                {signal, queueSession, flushNativePageBatch},
                 context,
                 discourseContext,
             ).then((translations) =>
@@ -926,6 +959,7 @@ async function translateTextSlotsInternal(
             && snapshot.enableNativeBatch !== false
             && fullPageSession?.active && fullPageSession.allowNativeBatch !== false;
         const canCombineAIParagraphs = isAICrossCandidateRequest;
+        const flushNativePageBatch = canCombineNativeParagraphs && snapshot.service === services.google;
         const request = (canCombineNativeParagraphs || canCombineAIParagraphs)
             ? enqueueTranslationBatchTask(
                 requestOrigins,
@@ -935,6 +969,7 @@ async function translateTextSlotsInternal(
                 fullPageSession!,
                 batchOwner,
                 discourseContext,
+                flushNativePageBatch,
             )
             : translateTextSlotsDirectly(
                 requestOrigins,
@@ -956,8 +991,15 @@ async function translateTextSlotsInternal(
     // 正在复用的 provider 请求；会话结束仍会统一中止底层工作。
     if (fullPageSession?.active && fullPageSession.requestSignal) {
         const aiOwnerIdentity = isAICrossCandidateRequest ? getAIBatchOwnerIdentity(batchOwner) : undefined;
-        const key = createRequestCacheKey(origins, snapshot, fullPageSession.pageContextGeneration ?? 0, aiOwnerIdentity, discourseContext);
-        const failureKey = createRequestCacheKey(origins, snapshot, -1, aiOwnerIdentity, discourseContext);
+        const nativeGooglePageBatch = snapshot.service === services.google
+            && supportsNativeTranslationBatch(snapshot.service)
+            && snapshot.enableNativeBatch !== false
+            && fullPageSession.allowNativeBatch !== false;
+        const cacheContext = nativeGooglePageBatch ? '' : requestContext;
+        const key = createRequestCacheKey(origins, snapshot, cacheContext,
+            fullPageSession.pageContextGeneration ?? 0, aiOwnerIdentity, discourseContext);
+        const failureKey = createRequestCacheKey(origins, snapshot, cacheContext,
+            -1, aiOwnerIdentity, discourseContext);
         const requestCache = fullPageSession.translationRequestCache ??= new Map();
         const failed = requestCache.get(failureKey);
         if (failed) {

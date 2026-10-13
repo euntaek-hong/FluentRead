@@ -151,6 +151,40 @@ describe('Google 批量传输与换线', () => {
         await expect(request).resolves.toEqual(sources.map((_, index) => `译文${index}`));
         expect(fetchMock.mock.calls.map(([url, init]) => requestData(url, init).texts.length)).toEqual([32, 32, 1]);
     });
+    it('全文 Google 页面波次先保留小 discovery slice，凑满十槽后一次提交已登记的所有文本', async () => {
+        fetchMock.mockImplementation(async (url, init) => successfulResponse(url,
+            requestData(url, init).texts.map(text => `译文${text.match(/\d+/)![0]}`)));
+        const first = api.translateGoogleTexts(['Paragraph 1', 'Paragraph 2', 'Paragraph 3', 'Paragraph 4', 'Paragraph 5'], 'en', 'zh',
+            undefined, 2_000, true, undefined, true);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(fetchMock).not.toHaveBeenCalled();
+
+        const second = api.translateGoogleTexts(['Paragraph 6', 'Paragraph 7', 'Paragraph 8', 'Paragraph 9', 'Paragraph 10'], 'en', 'zh',
+            undefined, 2_000, true, undefined, true);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(fetchMock).toHaveBeenCalledOnce();
+        expect(requestData(...fetchMock.mock.calls[0]!).texts)
+            .toEqual(['<pre>Paragraph 1</pre>', '<pre>Paragraph 2</pre>', '<pre>Paragraph 3</pre>',
+                '<pre>Paragraph 4</pre>', '<pre>Paragraph 5</pre>', '<pre>Paragraph 6</pre>',
+                '<pre>Paragraph 7</pre>', '<pre>Paragraph 8</pre>', '<pre>Paragraph 9</pre>', '<pre>Paragraph 10</pre>']);
+        await expect(flush(Promise.all([first, second]))).resolves.toEqual([
+            ['译文1', '译文2', '译文3', '译文4', '译文5'],
+            ['译文6', '译文7', '译文8', '译文9', '译文10'],
+        ]);
+    });
+    it('普通 Google 调用即使到达两个小批次仍保留 120ms 收集窗', async () => {
+        fetchMock.mockImplementation(async (url, init) => successfulResponse(url,
+            requestData(url, init).texts.map(text => `译文${text.match(/\d+/)![0]}`)));
+        const first = api.translateGoogleTexts(['Paragraph 1', 'Paragraph 2', 'Paragraph 3'], 'en', 'zh');
+        const second = api.translateGoogleTexts(['Paragraph 4', 'Paragraph 5'], 'en', 'zh');
+        await vi.advanceTimersByTimeAsync(119);
+        expect(fetchMock).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(fetchMock).toHaveBeenCalledOnce();
+        await expect(flush(Promise.all([first, second]))).resolves.toEqual([
+            ['译文1', '译文2', '译文3'], ['译文4', '译文5'],
+        ]);
+    });
     it('接近一万字符的普通段落可以合批，单个超长段落独立发送并保留完整内容', async () => {
         fetchMock.mockImplementation(async (url, init) => successfulResponse(url, requestData(url, init).texts.map(() => '完整译文')));
         await expect(flush(api.translateGoogleTexts(['A'.repeat(4900), 'B'.repeat(4900)], 'en', 'zh'))).resolves.toEqual(['完整译文', '完整译文']);

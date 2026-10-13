@@ -2,7 +2,7 @@
  * @file src/providers/translation/google.ts
  *
  * 文件职责：适配无需用户密钥的 Google 浏览器批量接口与网页 RPC，在统一截止时间内合批、换线和冷却失败入口。
- * 主要内容：编码 translateHtml、translate_a/t 与带编号的 batchexecute 批次，严格校验结果数量与槽位，保护纯文本、换行及取消所有权；按冻结偏好选择 120 毫秒合并同语言请求或直接逐条传输，满批提前发送，通过共享 HTTP 队列暂停全部限流入口并按 Retry-After 单独探测恢复；为每个实际入批 owner 登记真实传输租约，取消或超时立即返回但并发槽保留到网络及正文结算；按近期可靠性、延迟和在途负载动态排序，定期探索备用入口，保留非限流入口故障的独立冷却。为免费池提供不跨 owner 合批的数组传输入口。公开符号包括 parseGoogleBatchResponse、translateGoogleOwnerTexts、translateGoogleTexts、translateGoogleText、default:google。
+ * 主要内容：编码 translateHtml、translate_a/t 与带编号的 batchexecute 批次，严格校验结果数量与槽位，保护纯文本、换行及取消所有权；全文页面波次仅在至少十项后提前提交，小批次仍保留 120 毫秒收集窗；按冻结偏好选择 120 毫秒合并同语言请求或直接逐条传输，满批提前发送，通过共享 HTTP 队列暂停全部限流入口并按 Retry-After 单独探测恢复；为每个实际入批 owner 登记真实传输租约，取消或超时立即返回但并发槽保留到网络及正文结算；按近期可靠性、延迟和在途负载动态排序，定期探索备用入口，保留非限流入口故障的独立冷却。为免费池提供不跨 owner 合批的数组传输入口。公开符号包括 parseGoogleBatchResponse、translateGoogleOwnerTexts、translateGoogleTexts、translateGoogleText、default:google。
  * 模块边界：本文件位于 provider 适配层，只把统一翻译请求转换为外部或浏览器服务协议；不管理页面 DOM、UI 生命周期或配置持久化，缓存、去重和超时总预算由 translation broker 统一协调。
  */
 
@@ -45,6 +45,7 @@ const GOOGLE_FAILURE_COOLDOWN_MS = 30_000;
 const GOOGLE_BATCH_MAX_ITEMS = 32;
 const GOOGLE_BATCH_MAX_CHARACTERS = 10_000;
 const GOOGLE_BATCH_WINDOW_MS = 120;
+const GOOGLE_PAGE_BATCH_MIN_ITEMS = 10;
 const GOOGLE_EXPLORATION_INTERVAL = 10;
 const googleRequestGate = createGoogleRequestGate();
 
@@ -530,6 +531,7 @@ function flushGoogleTexts(): void {
 function enqueueGoogleText(
     text: string, fromLang: string, toLang: string, signal: AbortSignal,
     subscribeAbort: (callback: VoidFunction) => VoidFunction, deadlineAt: number, lease?: TranslationRequestLease,
+    deferFlush = false,
 ): Promise<string> {
     if (signal?.aborted) return Promise.reject(abortErrorFromSignal(signal));
     if (!hasTranslationContent(text)) return Promise.resolve(text);
@@ -544,9 +546,19 @@ function enqueueGoogleText(
         pendingTexts.push(task);
         const matching = pendingTexts.filter(item => item.fromLang === fromLang && item.toLang === toLang);
         const characters = matching.reduce((total, item) => total + escapeGoogleText(item.text).length + 11, 0);
-        if (matching.length >= GOOGLE_BATCH_MAX_ITEMS || characters >= GOOGLE_BATCH_MAX_CHARACTERS) flushGoogleTexts();
+        if (!deferFlush && (matching.length >= GOOGLE_BATCH_MAX_ITEMS || characters >= GOOGLE_BATCH_MAX_CHARACTERS)) flushGoogleTexts();
         else flushTimer ??= setTimeout(flushGoogleTexts, GOOGLE_BATCH_WINDOW_MS);
     });
+}
+
+function pendingGoogleBatchSize(fromLang: string, toLang: string): {items: number; characters: number} {
+    return pendingTexts.reduce((total, item) => {
+        if (item.fromLang !== fromLang || item.toLang !== toLang) return total;
+        return {
+            items: total.items + 1,
+            characters: total.characters + escapeGoogleText(item.text).length + 11,
+        };
+    }, {items: 0, characters: 0});
 }
 
 /** 上层已限定组大小并保留纯空白槽；本入口只复用原端点排序/超时，不共享在途请求或信号。 */
@@ -559,7 +571,7 @@ export function translateGoogleOwnerTexts(
 }
 
 export async function translateGoogleTexts(texts: readonly string[], fromLang: string, toLang: string, signal?: AbortSignal,
-    requestTimeoutMs?: number, enableNativeBatch = true, lease?: TranslationRequestLease): Promise<string[]> {
+    requestTimeoutMs?: number, enableNativeBatch = true, lease?: TranslationRequestLease, flushImmediately = false): Promise<string[]> {
     texts = [...texts];
     const controller = new AbortController();
     const abortCallbacks = new Set<VoidFunction>();
@@ -592,9 +604,15 @@ export async function translateGoogleTexts(texts: readonly string[], fromLang: s
             return translated;
         }
         const requests = texts.map(text => enqueueGoogleText(text, googleLanguage(fromLang), googleLanguage(toLang),
-            controller.signal, subscribeAbort, deadlineAt, lease));
-        // 显式大数组无需额外等收集窗；最后一个未满批次也立即进入有序 HTTP 队列。
-        if (texts.length >= GOOGLE_BATCH_MAX_ITEMS) flushGoogleTexts();
+            controller.signal, subscribeAbort, deadlineAt, lease, flushImmediately));
+        // 页面波次至少收齐十个短段后才提前提交。较小批次继续保留 120ms
+        // 窗口，让下一个 8ms discovery slice 能加入同一个 Google HTTP 请求。
+        // 页面波次会在调用方完成收集后才到达这里；循环中不允许满批提前发送，
+        // 使同一波次的所有文本按实际 HTML 转义字符数统一分组。
+        const pending = pendingGoogleBatchSize(googleLanguage(fromLang), googleLanguage(toLang));
+        if (texts.length >= GOOGLE_BATCH_MAX_ITEMS || (flushImmediately && (
+            pending.items >= GOOGLE_PAGE_BATCH_MIN_ITEMS || pending.characters >= GOOGLE_BATCH_MAX_CHARACTERS
+        ))) flushGoogleTexts();
         return await Promise.all(requests);
     } catch (error) {
         controller.abort(error);
@@ -618,7 +636,7 @@ async function google(message: TranslationProviderRequest) {
         ?? isNativeTranslationBatchEnabled('google', current.nativeBatchTranslationEnabled);
     const texts = typeof message.origin === 'string' ? [message.origin] : message.origin;
     const results = await translateGoogleTexts(texts, sourceLanguage, targetLanguage, message.abortSignal, message.requestTimeoutMs,
-        enableNativeBatch, getTranslationRequestScheduler(message)?.lease);
+        enableNativeBatch, getTranslationRequestScheduler(message)?.lease, message.flushNativePageBatch === true);
     return typeof message.origin === 'string' ? results[0]! : results;
 }
 
