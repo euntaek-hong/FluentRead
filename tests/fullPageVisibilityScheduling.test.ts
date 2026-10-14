@@ -9862,6 +9862,74 @@ describe("悬停重挂请求与 synthetic 提交回归", () => {
         await finishScheduledWork();
         expect(candidates.map(candidate => getTranslationState(candidate)?.phase)).toEqual(['translated', 'translated', 'translated']);
     });
+    it('finishes a reserved viewport member moved into prefetch before its dispatch', async () => {
+        runtime.viewportCommitEnabled = true;runtime.config.maxConcurrentTranslations = 1;
+        Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1280});
+        Object.defineProperty(window, 'innerHeight', {configurable: true, value: 815});
+        document.body.innerHTML = '<p>First reserved source.</p><p>Second reserved source.</p>';
+        const nodes = Array.from(document.querySelectorAll<HTMLElement>('p'));
+        nodes.forEach(node => {setLayoutBox(node, 600, 60);setViewportRect(node, 20, 60);});
+        runtime.candidates = nodes.map(element => ({element, kind: 'content', reason: 'moving-group-member'}));
+        const first = deferred<string[]>();
+        runtime.requests.mockImplementation(origins => origins[0] === 'First reserved source.'
+            ? first.promise : Promise.resolve(origins.map(origin => `译:${origin}`)));
+        autoTranslateEnglishPage();await waitForRequestCount(1);
+        setViewportRect(nodes[1]!, 1000, 60);
+        TestIntersectionObserver.instances[0]!.emit(nodes[1]!, true);
+        first.resolve(['译:First reserved source.']);await finishScheduledWork();
+        expect(runtime.requests).toHaveBeenCalledTimes(2);
+        expect(nodes.map(node => getTranslationState(node)?.phase)).toEqual(['translated', 'translated']);
+    });
+
+    it('does not let an aged distant task block a reserved viewport group', async () => {
+        runtime.viewportCommitEnabled = true;runtime.config.maxConcurrentTranslations = 1;
+        const previousEagerBudget = runtime.config.eagerTranslationCharacters;
+        try {
+        runtime.config.eagerTranslationCharacters = 2000;
+        Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1280});
+        Object.defineProperty(window, 'innerHeight', {configurable: true, value: 815});
+        document.body.innerHTML = Array.from({length: 11}, (_, index) => `<p>Reserved paragraph ${index}.</p>`).join('');
+        const nodes = Array.from(document.querySelectorAll<HTMLElement>('p'));
+        nodes.forEach((node, index) => {setLayoutBox(node, 600, 60);setViewportRect(node, index < 10 ? 20 : 5000, 60);});
+        runtime.candidates = nodes.map(element => ({element, kind: 'content', reason: 'group-before-aged-background'}));
+        const first = deferred<string[]>();
+        runtime.requests.mockImplementation(origins => origins[0] === 'Reserved paragraph 0.'
+            ? first.promise : Promise.resolve(origins.map(origin => `译:${origin}`)));
+        autoTranslateEnglishPage();await waitForRequestCount(1);
+        await vi.advanceTimersByTimeAsync(8500);
+        first.resolve(['译:Reserved paragraph 0.']);await finishScheduledWork();
+        expect(nodes.slice(0, 10).map(node => getTranslationState(node)?.phase)).toEqual(Array(10).fill('translated'));
+        expect(runtime.requests.mock.calls.slice(0, 10).map(([origins]) => origins[0]))
+            .toEqual(Array.from({length: 10}, (_, index) => `Reserved paragraph ${index}.`));
+        } finally {runtime.config.eagerTranslationCharacters = previousEagerBudget;}
+    });
+
+    it('admits a new modal while a body viewport group still has staged and pending members', async () => {
+        runtime.viewportCommitEnabled = true;runtime.config.maxConcurrentTranslations = 1;
+        Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1280});
+        Object.defineProperty(window, 'innerHeight', {configurable: true, value: 815});
+        document.body.innerHTML = ['First', 'Second', 'Third'].map(text => `<p>${text} body source.</p>`).join('');
+        const nodes = Array.from(document.querySelectorAll<HTMLElement>('p'));
+        nodes.forEach(node => {setLayoutBox(node, 600, 60);setViewportRect(node, 20, 60);});
+        runtime.candidates = nodes.map(element => ({element, kind: 'content', reason: 'body-group'}));
+        const first = deferred<string[]>();const second = deferred<string[]>();
+        runtime.requests.mockImplementation(origins => origins[0] === 'First body source.' ? first.promise
+            : origins[0] === 'Second body source.' ? second.promise : Promise.resolve(origins.map(origin => `译:${origin}`)));
+        autoTranslateEnglishPage();await waitForRequestCount(1);
+        first.resolve(['译:First body source.']);await waitForRequestCount(2);
+        const notice = document.createElement('section');notice.setAttribute('role', 'dialog');notice.setAttribute('aria-modal', 'true');
+        notice.innerHTML = '<p>Please read the modal announcement.</p>';document.body.append(notice);
+        const announcement = notice.firstElementChild as HTMLElement;
+        setLayoutBox(notice, 600, 180);setViewportRect(notice, 20, 180);
+        setLayoutBox(announcement, 600, 60);setViewportRect(announcement, 30, 60);
+        runtime.candidates.push({element: announcement, kind: 'content', reason: 'modal-group'});
+        TestMutationObserver.instances[0]!.emit([{type: 'childList', target: document.body,
+            addedNodes: [notice], removedNodes: []} as unknown as MutationRecord]);
+        await finishScheduledWork();
+        expect(getTranslationState(announcement)?.phase).toBe('translated');
+        expect(runtime.requests.mock.calls.map(([origins]) => origins[0])).toContain('Please read the modal announcement.');
+    });
+
     it('viewport group waits for visible article candidates after a sidebar crosses the viewport boundary', async () => {
         runtime.viewportCommitEnabled = true;
         runtime.config.display = 1;
@@ -9957,6 +10025,29 @@ describe("悬停重挂请求与 synthetic 提交回归", () => {
         expect(getTranslationState(nodes[1]!)?.phase).toBe('loading');
         near.resolve(['译:Nearby slow source.']);await finishScheduledWork();
         expect(getTranslationState(nodes[1]!)?.phase).toBe('translated');
+    });
+
+    it('prepares the current viewport before nearby work without changing its atomic paint', async () => {
+        runtime.viewportCommitEnabled = true;runtime.nativeBatchEnabled = true;
+        runtime.config.service = 'google';runtime.config.display = 1;
+        Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1280});
+        Object.defineProperty(window, 'innerHeight', {configurable: true, value: 815});
+        document.body.innerHTML = '<p>Visible priority source.</p><p>Nearby deferred source.</p>';
+        const nodes = Array.from(document.querySelectorAll<HTMLElement>('p'));
+        nodes.forEach(node => setLayoutBox(node, 600, 60));
+        setViewportRect(nodes[0]!, 100, 60);setViewportRect(nodes[1]!, 1700, 60);
+        runtime.candidates = nodes.map(element => ({element, kind: 'content', reason: 'visible-first-preparation'}));
+        const visible = deferred<string[]>();
+        runtime.requests.mockImplementation(origins => origins.includes('Visible priority source.')
+            ? visible.promise : Promise.resolve(origins.map(origin => `译:${origin}`)));
+        autoTranslateEnglishPage();await vi.advanceTimersByTimeAsync(25);
+        expect(runtime.requests.mock.calls.map(([origins]) => origins)).toEqual([['Visible priority source.']]);
+        expect(getTranslationState(nodes[1]!)).toBeUndefined();
+        visible.resolve(['译:Visible priority source.']);await finishScheduledWork();
+        expect(runtime.requests.mock.calls.map(([origins]) => origins)).toEqual([
+            ['Visible priority source.'], ['Nearby deferred source.'],
+        ]);
+        expect(nodes.map(node => getTranslationState(node)?.phase)).toEqual(['translated', 'translated']);
     });
 
     async function stagedViewportPair() {

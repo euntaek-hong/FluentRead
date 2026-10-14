@@ -2,6 +2,7 @@
  * @file src/features/full-page-translation/content/runtime.ts
  * 文件职责：实现全文翻译的页面级会话引擎，负责候选发现、可见性调度、Google viewport 无 DOM 预准备、当前与周边的独立 prime、同步等待动画和原子提交、动态 DOM 重扫、失败重试、缓存复用和恢复原文。
  * 主要内容：精确相同译文和有同目标语言证据的排版回显保留原文且不重复展示；以增量计数发布完成与失败摘要，仅对本会话失败目标重试和定位；维护 FullPageSession、AbortController、Intersection/Mutation 观察器、弹窗优先调度、精确属性写入过滤、候选所有权和生命周期重试；对变化来源等待安静窗口、跳过持续变化的计数，并清理延迟重扫，只有真实宿主删除启动候选回收，同批重复属性变化只处理一次；按时间片派发并在全文结果提交前让出主线程，合并同段 DOM 写入并在重挂时复用同批布局读数与单文本来源快照；Google viewport 仅从既有 IO pending 计划预准备有界请求，不创建 wrapper、spinner 或翻译状态；合成行内段在延迟 loading 前后都按精确来源节点、HTML 和 Text 槽识别自身迁移；已拥有状态的发现候选直接登记复验，取消记录命中后才提取原文，避免整批重扫重复计算熔断签名；连续滚动时限频派发当前可见候选，空闲后恢复预取，按阅读进度撤回离开预取区的待派发候选，冻结请求/展示配置与识别范围，在弹窗关闭后继续正文，按实际节点阶段发布进度及工具栏结果；悬浮按候选停留而非每次移动计时，同段复用冻结的独立服务与快捷方案配置，到期复验最新命中并在路由切换取消；同目标预检单独读取受保护规则约束的行内代码语言上下文，发送与渲染仍只使用可翻译文本槽；恢复单个所有者或全文时重置篇章证据，统一恢复原文并清理重挂预算及孤儿产物；向局部翻译开放单候选 translateTarget 与单个译文所有者的恢复入口。
+ * 性能约束：初始原子组只提取一次入队来源，复用同次同步派发的活槽；当前固定组优先结算，附近预取随后恢复，组成员的布局移动和后台公平性不能阻塞结算。
  * 模块边界：这是 content 侧编排层，不实现 provider 协议、纯候选算法或底层状态存储；翻译调用经 app client，发现规则来自 core/translation，渲染与状态分别交给 renderer、liveTextRender 和 state。
  */
 import {createFullPageMutationRuntime} from './mutationRuntime';
@@ -834,12 +835,15 @@ function shouldPrepareGoogleViewport(session: FullPageSession): boolean {
 /** Initial IO delivery order is not an admission boundary. */
 function releaseInitialGoogleVisibleWave(session: FullPageSession): void {
     if (session.googleInitialWaveDiscoveryReady) return;
-    session.observedCandidates.forEach((candidates, anchor) => {
-        if (!isAnchorVisible(anchor)) return;
-        candidates.forEach((candidate, key) => {
-            queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
+    // 原子视口会在完整发现后统一入队；此处无需重复提取尚不能派发的来源。
+    if (!isViewportCommitGroupEnabled() || session.translationMode !== 'viewport' || session.viewportCommitDiscoveryReady) {
+        session.observedCandidates.forEach((candidates, anchor) => {
+            if (!isAnchorVisible(anchor)) return;
+            candidates.forEach((candidate, key) => {
+                queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
+            });
         });
-    });
+    }
     session.googleInitialWaveDiscoveryReady = true;
     invalidateGoogleDispatchPlan(session);
 }
@@ -886,11 +890,16 @@ function startFullPageTitleTranslationIfNeeded(session: FullPageSession): void {
     startFullPageTitleTranslation(session.translationConfig);
 }
 
+function isFullPageDispatchEligible(session: FullPageSession, candidate: TranslationCandidate): boolean {
+    if (session.modal) return isWithinTranslationModal(session.modal, candidate.element);
+    return session.viewportCommitTickets.size === 0 || session.viewportCommitTickets.has(getTranslationCandidateKey(candidate));
+}
+
 function ensureGoogleDispatchPlan(session: FullPageSession, scrolling: boolean): FullPageDispatchPlan {
     if (session.dispatchPlan) return session.dispatchPlan;
     session.prepareCursor = 0;
     session.dispatchPlan = createFullPageDispatchPlan(session, {now: Date.now(), viewportHeight: window.innerHeight, visibleOnly: scrolling,
-        isEligible: candidate => !session.modal || isWithinTranslationModal(session.modal, candidate.element),
+        isEligible: candidate => isFullPageDispatchEligible(session, candidate),
         resolveSource: candidateLifecycleSource});
     return session.dispatchPlan;
 }
@@ -898,13 +907,17 @@ function ensureGoogleDispatchPlan(session: FullPageSession, scrolling: boolean):
 function prepareGoogleDispatchPlan(session: FullPageSession, startedAt: number): boolean {
     const plan = session.dispatchPlan;
     if (!plan) return true;
+    const visibleFirst = !session.modal && isViewportCommitGroupEnabled() && (session.viewportCommitTickets.size > 0 ||
+        plan.candidates.some(({key, candidate, priority}) => priority.band === 'visible' &&
+            session.pending.get(key) === candidate && !session.inFlightCandidates.has(key)));
     while (session.prepareCursor < plan.candidates.length && performance.now() - startedAt < 8) {
         const selection = plan.candidates[session.prepareCursor++]!;
         if (session.pending.get(selection.key) !== selection.candidate
             || session.inFlightCandidates.has(selection.key)) continue;
-        // plan은 visible을 먼저 정렬한다. 남은 bounded 준비 예산으로 nearby 원문도
-        // 독립 slot으로 준비하지만 첫 화면 commit barrier에는 넣지 않는다.
-        if (selection.priority.band === 'background') continue;
+        // 原子画面先准备固定成员；附近独立槽在结算后的新计划继续，不占当前读取预算。
+        // 已预约成员移到附近仍需完成；更远候选继续只保留观察元数据。
+        if (selection.priority.band === 'background' ||
+            (visibleFirst && selection.priority.band !== 'visible' && !session.viewportCommitTickets.has(selection.key))) continue;
         prepareGoogleCandidate(session, selection.candidate);
         if (session.preparedSlots >= FULL_PAGE_PREPARE_MAX_TEXT_SLOTS
             || session.preparedEscapedCharacters >= FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS) return true;
@@ -1405,6 +1418,7 @@ function createViewportCommitGroupForPlan(session: FullPageSession, plan: FullPa
     group = createViewportCommitGroup((entries) => {
         motion.dispose();
         session.viewportCommitGroups.delete(group);
+        invalidateGoogleDispatchPlan(session);
         const validEntries = entries.filter(entry =>
             entry.isActive() && session.active && fullPageSession === session && entry.isCurrent());
         entries.forEach(entry => {
@@ -1454,6 +1468,9 @@ function drainFullPage(session: FullPageSession): void {
     }
     const scrolling = session.scrollController.isScrolling;
     refreshFullPageModal(session);
+    // 当前画面的固定组尚在等待时，近处预取不占用其预算；新弹窗仍保留原有优先级。
+    if (!session.modal && session.viewportCommitTickets.size > 0 &&
+        ![...session.pending.keys()].some(key => session.viewportCommitTickets.has(key))) return;
     session.draining = true;
     const maxConcurrent = normalizeMaxConcurrentTranslations(config.maxConcurrentTranslations);
     const startedAt = performance.now();
@@ -1472,7 +1489,7 @@ function drainFullPage(session: FullPageSession): void {
     }
     plan ??= session.pending.size > 0
         ? createFullPageDispatchPlan(session, {now: Date.now(), viewportHeight: window.innerHeight, visibleOnly: scrolling,
-            isEligible: candidate => !session.modal || isWithinTranslationModal(session.modal, candidate.element),
+            isEligible: candidate => isFullPageDispatchEligible(session, candidate),
             resolveSource: candidateLifecycleSource})
         : undefined;
     if (plan) createViewportCommitGroupForPlan(session, plan);
@@ -1483,7 +1500,7 @@ function drainFullPage(session: FullPageSession): void {
         plan ??= preparesGoogleViewport
             ? ensureGoogleDispatchPlan(session, scrolling)
             : createFullPageDispatchPlan(session, {now: Date.now(), viewportHeight: window.innerHeight, visibleOnly: scrolling,
-                isEligible: candidate => !session.modal || isWithinTranslationModal(session.modal, candidate.element),
+                isEligible: candidate => isFullPageDispatchEligible(session, candidate),
                 resolveSource: candidateLifecycleSource});
         const selection = plan.next();
         if (!selection) {
