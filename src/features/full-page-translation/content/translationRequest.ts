@@ -12,6 +12,7 @@ import {styles} from '@/src/core/config/constants';
 import {
     parseTranslationSlots,
     serializeTranslationSlots,
+    type TranslationTextSlot,
 } from '@/src/core/translation/public';
 import {config} from '@/src/services/config/store';
 import {normalizeMaxConcurrentTranslations} from '@/src/core/config/scheduling';
@@ -66,6 +67,8 @@ export interface FullPageTranslationCacheEntry {
 export interface NativeGooglePrimeProof {
     origins: readonly string[];
     invocationIdentity: string;
+    /** runtime 在同一同步派发中刚验证的活槽；身份或当前值不匹配时由请求层重新收集。 */
+    validatedSlots?: readonly TranslationTextSlot[];
 }
 
 export interface FullPageTranslationRequestCacheEntry {

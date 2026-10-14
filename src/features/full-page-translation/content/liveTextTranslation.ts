@@ -2,6 +2,7 @@
  * @file src/features/full-page-translation/content/liveTextTranslation.ts
  * 文件职责：按候选类型、展示模式和识别范围选择文本槽请求，保留异步提交所需的来源与译文快照。
  * 主要内容：精确相同译文和有同目标语言证据的排版回显保留原文且不重复展示；冻结整个请求与回退链路的配置，为正文双语构造文本快照，对可无损拍平的多槽候选重建整段原文并整块请求、整段译文回填首个槽位，为交互控件和仅译文模式构造带前后缀的实时 Text 槽结果，为按钮型 input 构造属性替换结果，统一传递取消、重试、范围与会话参数。
+ * 同步槽复用：原生预准备只接受 runtime 刚收集且身份、原文、节点和值一致的活槽，失败仍重新收集；不跨异步边界复用保护结论。
  * 模块边界：本文件不管理 DOM 状态、不决定候选、不监听 mutation；runtime 负责 generation 校验和最终渲染。
  */
 import {
@@ -11,6 +12,7 @@ import {
     getCurrentTranslationCore,
     getTranslatableControlValueAttribute,
     normalizeTranslationText,
+    type TranslationTextSlot,
 } from '@/src/core/translation/public';
 import type {TranslationScope, TranslationTextProtectionOptions} from '@/src/core/translation/public';
 import {hasDistinctTargetTranslation as hasDistinctTranslation} from '@/src/core/translation/targetResult';
@@ -125,8 +127,9 @@ export async function translateLiveText(
     protectionOptions?: TranslationTextProtectionOptions,
     forceFailedRequest = false,
     scope?: TranslationScope,
+    validatedSlots?: readonly TranslationTextSlot[],
 ): Promise<LiveTextTranslationResult> {
-    const parts = collectLiveTranslationTextSlots(
+    const parts = validatedSlots ?? collectLiveTranslationTextSlots(
         node,
         getCurrentTranslationCore(scope).shouldStayOriginal,
         undefined,
@@ -170,6 +173,18 @@ export async function translateLiveText(
     };
 }
 
+function getValidatedPrimeSlots(
+    node: HTMLElement,
+    proof: NativeGooglePrimeProof | undefined,
+    snapshot: FullPageTranslationConfigSnapshot,
+): readonly TranslationTextSlot[] | undefined {
+    const slots = proof?.validatedSlots;
+    if (!slots || proof.invocationIdentity !== getTranslationInvocationIdentity(snapshot) ||
+        slots.length !== proof.origins.length) return undefined;
+    return slots.every((slot, index) => slot.source === proof.origins[index] && node.contains(slot.node) &&
+        slot.node.nodeValue === `${slot.prefix}${slot.source}${slot.suffix}`) ? slots : undefined;
+}
+
 export type TranslationResult = (LiveTextTranslationResult | ControlValueTranslationResult | {
     kind: 'snapshot';
     sources: readonly string[];
@@ -196,11 +211,12 @@ export async function createTranslationRequest(
         return translateControlValue(node, controlValueAttribute, snapshot, signal,
             queueSession, fullPageSession, forceFailedRequest);
     }
+    const validatedPrimeSlots = getValidatedPrimeSlots(node, nativeGooglePrimeProof, snapshot);
     if (kind === 'control' || mode === 'single') {
         return translateLiveText(node, snapshot, signal, queueSession, fullPageSession,
-            protectionOptions, forceFailedRequest, scope);
+            protectionOptions, forceFailedRequest, scope, validatedPrimeSlots);
     }
-    const parts = collectLiveTranslationTextSlots(node, getCurrentTranslationCore(scope).shouldStayOriginal,
+    const parts = validatedPrimeSlots ?? collectLiveTranslationTextSlots(node, getCurrentTranslationCore(scope).shouldStayOriginal,
         undefined, protectionOptions);
     const origins = parts.map((part) => part.source);
     if (origins.length === 0) return {kind: 'snapshot', sources: [], translations: []};

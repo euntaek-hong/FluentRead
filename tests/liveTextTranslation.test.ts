@@ -321,6 +321,80 @@ describe('目标语言排版回显保持网页原文', () => {
 });
 
 describe('Google prime proof follows exact frozen source slots', () => {
+    it.each(['identity', 'count', 'origin', 'detached'] as const)('recollects current slots for invalid handoff %s', async invalid => {
+        const {document} = parseHTML('<html><body><p>Current source</p></body></html>');
+        const node = document.querySelector('p')!;const current = node.firstChild as Text;
+        runtime.slots = [{node: current, prefix: '', source: 'Current source', suffix: ''}];
+        runtime.translations = ['현재 번역'];
+        const proof = {invocationIdentity: invalid === 'identity' ? 'old-invocation' : 'frozen-invocation',
+            origins: invalid === 'count' ? ['Current source', 'Extra'] : invalid === 'origin' ? ['Different source'] : ['Current source'],
+            validatedSlots: [{node: invalid === 'detached' ? document.createTextNode('Current source') : current,
+                prefix: '', source: 'Current source', suffix: ''}]};
+        const result = await createTranslationRequest(node, 'content', 'single', snapshot,
+            undefined, undefined, undefined, undefined, false, undefined, proof);
+        expect(result).toMatchObject({sources: ['Current source'], nodes: [current]});
+    });
+    it.each(['single', 'bilingual'] as const)('uses the runtime-validated slots for %s without a second collection', async mode => {
+        const {document} = parseHTML('<html><body><p>Current source</p></body></html>');
+        const node = document.querySelector('p')!;
+        const current = node.firstChild as Text;
+        // The mocked collector represents a later, mismatching read. A valid handoff must use the
+        // synchronous post-materialization slots captured by the runtime instead.
+        runtime.slots = [{node: current, prefix: '', source: 'Later mismatch', suffix: ''}];
+        runtime.translations = ['현재 번역'];
+        runtime.consumeNativeGooglePrimeProof.mockClear();
+        runtime.translateTextSlots.mockClear();
+        const result = await createTranslationRequest(
+            node,
+            'content',
+            mode,
+            {...snapshot, displayMode: mode},
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            false,
+            undefined,
+            {
+                invocationIdentity: 'frozen-invocation',
+                origins: ['Current source'],
+                validatedSlots: [{node: current, prefix: '', source: 'Current source', suffix: ''}],
+            },
+        );
+        expect(result).toMatchObject({sources: ['Current source'], translations: ['현재 번역']});
+        if (mode === 'bilingual') {
+            expect(runtime.consumeNativeGooglePrimeProof).toHaveBeenCalledTimes(1);
+            expect(runtime.translateTextSlots).not.toHaveBeenCalled();
+        } else {
+            expect(runtime.consumeNativeGooglePrimeProof).not.toHaveBeenCalled();
+            expect(runtime.translateTextSlots).toHaveBeenCalledWith(
+                ['Current source'], expect.anything(), undefined, undefined, undefined, false,
+            );
+        }
+    });
+    it('falls back to a fresh collection when a forwarded slot changed', async () => {
+        const {document} = parseHTML('<html><body><p>Changed source</p></body></html>');
+        const node = document.querySelector('p')!;
+        const current = node.firstChild as Text;
+        runtime.slots = [{node: current, prefix: '', source: 'Changed source', suffix: ''}];
+        runtime.translations = ['변경된 번역'];
+        runtime.consumeNativeGooglePrimeProof.mockClear();
+        runtime.translateTextSlots.mockClear();
+        const result = await createTranslationRequest(
+            node, 'content', 'bilingual', {...snapshot, displayMode: 'bilingual'},
+            undefined, undefined, undefined, undefined, false, undefined,
+            {
+                invocationIdentity: 'frozen-invocation',
+                origins: ['Current source'],
+                validatedSlots: [{node: current, prefix: '', source: 'Current source', suffix: ''}],
+            },
+        );
+        expect(result).toMatchObject({sources: ['Changed source'], translations: ['변경된 번역']});
+        expect(runtime.consumeNativeGooglePrimeProof).not.toHaveBeenCalled();
+        expect(runtime.translateTextSlots).toHaveBeenCalledWith(
+            ['Changed source'], expect.anything(), undefined, undefined, undefined, false,
+        );
+    });
     it.each([
         {identity: 'frozen-invocation', origins: ['Source'], match: true},
         {identity: 'older-invocation', origins: ['Source'], match: false},

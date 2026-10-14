@@ -1135,12 +1135,13 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
     // 捕获每个候选中可翻译 Text 节点的精确身份。renderer 可能在提交后只替换受保护的
     // MathJax/KaTeX 子节点；仅比较原文无法区分这种无害事务与同文本宿主/链接替换，
     // 后者会使已渲染快照失效。
-    const sourceTextNodes = collectLiveTranslationTextSlots(
+    const currentTextSlots = collectLiveTranslationTextSlots(
         node,
         core.shouldStayOriginal,
         synthetic ? node : undefined,
         getTranslationTextProtectionOptions(candidate.allowTopLevelApplicationShell, node),
-    ).map((slot) => slot.node);
+    );
+    const sourceTextNodes = currentTextSlots.map((slot) => slot.node);
     const attempt = beginTranslation(
         node,
         displayMode,
@@ -1187,7 +1188,9 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
         requestProtectionOptions,
         forceFailedRequest,
         candidate.scope,
-        preparedCandidate?.nativeGooglePrimeProof,
+        preparedCandidate && !synthetic && kind === 'content'
+            ? {...preparedCandidate.nativeGooglePrimeProof, validatedSlots: currentTextSlots}
+            : preparedCandidate?.nativeGooglePrimeProof,
     )
         .finally(() => { signal.removeEventListener('abort', cancelQueuedRequest); releaseRequestSession(); });
     if (synthetic) node.setAttribute('data-fr-translation-segment', 'true');
