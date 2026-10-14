@@ -9,7 +9,7 @@ export type FullPageScrollDirection = 'forward' | 'backward' | 'unknown';
 export type FullPagePriorityBand = 'visible' | 'near' | 'background';
 
 /** 与 IntersectionObserver 的预取范围保持一致；它是候选进入队列的门槛，不是最终排序。 */
-export const FULL_PAGE_PREFETCH_MARGIN_PX = 600;
+export const FULL_PAGE_PREFETCH_MARGIN_PX = 1200;
 /** 长时间等待的离屏任务不能永久被当前视口淹没。 */
 export const FULL_PAGE_BACKGROUND_MAX_WAIT_MS = 8_000;
 /** 连续处理前景任务后允许一次后台任务，避免全文模式永远只翻译当前区域。 */

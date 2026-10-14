@@ -9900,6 +9900,65 @@ describe("悬停重挂请求与 synthetic 提交回归", () => {
             expect(offscreen.every(node => getTranslationState(node) === undefined)).toBe(true);
         } finally {clock.mockRestore();}
     });
+    it('initial viewport requests do not wait for the mutation debounce', async () => {
+        runtime.viewportCommitEnabled = true;
+        runtime.config.display = 1;
+        Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1280});
+        Object.defineProperty(window, 'innerHeight', {configurable: true, value: 815});
+        document.body.innerHTML = '<p>Immediate visible source.</p>';
+        const element = document.querySelector<HTMLElement>('p')!;
+        setLayoutBox(element, 600, 60);setViewportRect(element, 100, 60);
+        runtime.candidates = [{element, kind: 'content', reason: 'initial-immediate'}];
+        autoTranslateEnglishPage();
+        await vi.advanceTimersByTimeAsync(10);
+        expect(runtime.requests).toHaveBeenCalledWith(['Immediate visible source.']);
+    });
+
+    it('initial atomic viewport primes nearby paragraphs without waiting for a second intersection callback', async () => {
+        runtime.viewportCommitEnabled = true;
+        runtime.nativeBatchEnabled = true;
+        runtime.config.service = 'google';
+        runtime.config.display = 1;
+        Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1280});
+        Object.defineProperty(window, 'innerHeight', {configurable: true, value: 815});
+        document.body.innerHTML = '<p id="visible">Visible independent paragraph.</p><p id="ahead">Nearby independent paragraph.</p><p id="distant">Distant independent paragraph.</p>';
+        const nodes = Array.from(document.querySelectorAll<HTMLElement>('p'));
+        nodes.forEach(node => setLayoutBox(node, 600, 60));
+        setViewportRect(nodes[0]!, 100, 60);
+        setViewportRect(nodes[1]!, 1700, 60);
+        setViewportRect(nodes[2]!, 3000, 60);
+        runtime.candidates = nodes.map(element => ({element, kind: 'content', reason: 'initial-prefetch'}));
+        autoTranslateEnglishPage();
+        await finishScheduledWork();
+        const requested = runtime.requests.mock.calls.flatMap(([origins]) => [...origins]);
+        expect(requested).toContain('Visible independent paragraph.');
+        expect(requested).toContain('Nearby independent paragraph.');
+        expect(requested).not.toContain('Distant independent paragraph.');
+        expect(runtime.requests.mock.calls.map(([origins]) => origins)).toEqual([['Visible independent paragraph.'], ['Nearby independent paragraph.']]);
+        expect(nodes.slice(0, 2).map(node => getTranslationState(node)?.phase)).toEqual(['translated', 'translated']);
+        expect(getTranslationState(nodes[2]!)).toBeUndefined();
+    });
+
+    it('slow prefetch responses do not hold the visible viewport commit', async () => {
+        runtime.viewportCommitEnabled = true;runtime.nativeBatchEnabled = true;
+        runtime.config.service = 'google';runtime.config.display = 1;
+        Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1280});
+        Object.defineProperty(window, 'innerHeight', {configurable: true, value: 815});
+        document.body.innerHTML = '<p>Visible fast source.</p><p>Nearby slow source.</p>';
+        const nodes = Array.from(document.querySelectorAll<HTMLElement>('p'));
+        nodes.forEach(node => setLayoutBox(node, 600, 60));
+        setViewportRect(nodes[0]!, 100, 60);setViewportRect(nodes[1]!, 1700, 60);
+        runtime.candidates = nodes.map(element => ({element, kind: 'content', reason: 'independent-prefetch'}));
+        const near = deferred<string[]>();
+        runtime.requests.mockImplementation(origins => origins.includes('Nearby slow source.') ? near.promise : Promise.resolve(origins.map(origin => `译:${origin}`)));
+        autoTranslateEnglishPage();
+        await vi.advanceTimersByTimeAsync(25);
+        expect(getTranslationState(nodes[0]!)?.phase).toBe('translated');
+        expect(getTranslationState(nodes[1]!)?.phase).toBe('loading');
+        near.resolve(['译:Nearby slow source.']);await finishScheduledWork();
+        expect(getTranslationState(nodes[1]!)?.phase).toBe('translated');
+    });
+
     async function stagedViewportPair() {
         runtime.viewportCommitEnabled = true;
         runtime.config.display = 1;

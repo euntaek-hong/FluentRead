@@ -843,11 +843,11 @@ function releaseInitialGoogleVisibleWave(session: FullPageSession): void {
     invalidateGoogleDispatchPlan(session);
 }
 
-/** 多列页面的 DOM 顺序不等于屏幕顺序；初始发现完成后仅把可见锚点纳入提交组。 */
+/** 多列页面按实际几何恢复初始预取队列；提交组仍只保留当前可见锚点。 */
 function releaseInitialViewportCommitGroup(session: FullPageSession): void {
     if (session.viewportCommitDiscoveryReady) return;
     session.observedCandidates.forEach((candidates, anchor) => {
-        if (!isAnchorVisible(anchor)) return;
+        if (!isAnchorNearViewport(anchor)) return;
         candidates.forEach((candidate, key) => {
             queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
         });
@@ -901,9 +901,9 @@ function prepareGoogleDispatchPlan(session: FullPageSession, startedAt: number):
         const selection = plan.candidates[session.prepareCursor++]!;
         if (session.pending.get(selection.key) !== selection.candidate
             || session.inFlightCandidates.has(selection.key)) continue;
-        // 첫 wave의 transport 예산은 실제 화면에 보이는 본문에만 쓴다. near 후보는
-        // 기존 queue가 다음 drain에서 처리하므로 첫 결과를 밀어내지 않는다.
-        if (!isAnchorVisible(selection.candidate.element)) continue;
+        // plan은 visible을 먼저 정렬한다. 남은 bounded 준비 예산으로 nearby 원문도
+        // 독립 slot으로 준비하지만 첫 화면 commit barrier에는 넣지 않는다.
+        if (selection.priority.band === 'background') continue;
         prepareGoogleCandidate(session, selection.candidate);
         if (session.preparedSlots >= FULL_PAGE_PREPARE_MAX_TEXT_SLOTS
             || session.preparedEscapedCharacters >= FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS) return true;
@@ -917,11 +917,15 @@ function prepareGoogleDispatchPlan(session: FullPageSession, startedAt: number):
 function primePreparedGoogleWave(session: FullPageSession): boolean {
     if (session.primedGoogleWave) return false;
     const entries = [...session.preparedCandidates.values()].filter(entry => !entry.consumed && !entry.controller.signal.aborted);
-    const origins = entries.flatMap(entry => entry.origins);
-    if (origins.length === 0) return false;
+    if (entries.length === 0) return false;
     const controller = new AbortController();
     session.requestControllers.add(controller);
-    const request = primeNativeGooglePageSlots(origins, session.translationConfig, session, controller.signal);
+    // 远一屏的慢响应不能阻止当前画面；两个独立 prime 各自注册 slot promise。
+    const visible = entries.filter(entry => isAnchorVisible(entry.candidate.element));
+    const nearby = entries.filter(entry => !visible.includes(entry));
+    const requests = [visible, nearby].filter(group => group.length > 0).map(group =>
+        primeNativeGooglePageSlots(group.flatMap(entry => entry.origins), session.translationConfig, session, controller.signal));
+    const request = Promise.all(requests).then(results => results.flat());
     startFullPageTitleTranslationIfNeeded(session);
     session.primedGoogleWave = request;
     session.primedGoogleWaveController = controller;
@@ -1672,7 +1676,10 @@ function enqueueFullPageRescan(session: FullPageSession, changedNode: Node): voi
         session.dirtyRoots.add(dirtyRoot);
     }
     if (session.mutationFlushTimer !== null) return;
-    session.mutationFlushTimer = window.setTimeout(() => flushMutationRescans(session), 50);
+    // 初始视口发现不是 mutation burst；立即进入 8ms 切片，不付 50ms debounce。
+    const delay = isViewportCommitGroupEnabled() && session.translationMode === 'viewport'
+        && !session.viewportCommitDiscoveryReady ? 0 : 50;
+    session.mutationFlushTimer = window.setTimeout(() => flushMutationRescans(session), delay);
 }
 
 /** 扩大范围仅重建展示类型变化或新增可译 Text 槽的 owner，其余正文和在途请求保持不变。 */
