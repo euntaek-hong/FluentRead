@@ -86,7 +86,7 @@ describe('Google 批量传输与换线', () => {
             .resolves.toEqual(['译文1', ' \n', '译文2']);
         expect(fetchMock.mock.calls.map(([url, init]) => requestData(url, init).texts.length)).toEqual([1, 1]);
         expect(starts[0]).toBe(start);
-        expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(150);
+        expect(starts[1]).toBe(starts[0]);
     });
     it('关闭合批的异步逐条链在入口复制来源，外部修改不能改变后续槽', async () => {
         const origins = ['Paragraph 1', 'Paragraph 2'];
@@ -138,15 +138,15 @@ describe('Google 批量传输与换线', () => {
         }
         await expect(flush(Promise.all(requests))).resolves.toEqual(Array.from({length: 20}, (_, index) => `译文${index}`));
         expect(fetchMock.mock.calls.map(([url, init]) => requestData(url, init).texts.length)).toEqual([4, 4, 4, 4, 4]);
-        expect(starts.slice(1).every((at, index) => at - starts[index]! >= 150)).toBe(true);
+        expect(starts.map(at => at - starts[0]!)).toEqual([0, 120, 240, 360, 480]);
     });
-    it('显式大数组满批立即发送，尾批只等待 HTTP 节流，不再等待收集窗', async () => {
+    it('显式大数组满批和尾批立即占用可用 HTTP 槽，不再等待收集窗', async () => {
         fetchMock.mockImplementation(async (url, init) => successfulResponse(url,
             requestData(url, init).texts.map(text => `译文${text.match(/\d+/)![0]}`)));
         const sources = Array.from({length: 65}, (_, index) => `Paragraph ${index}`);
         const request = api.translateGoogleTexts(sources, 'en', 'zh');
         await vi.advanceTimersByTimeAsync(0);
-        expect(fetchMock).toHaveBeenCalledOnce();
+        expect(fetchMock).toHaveBeenCalledTimes(3);
         await vi.advanceTimersByTimeAsync(400);
         await expect(request).resolves.toEqual(sources.map((_, index) => `译文${index}`));
         expect(fetchMock.mock.calls.map(([url, init]) => requestData(url, init).texts.length)).toEqual([32, 32, 1]);
@@ -440,15 +440,17 @@ describe('Google 所有入口共享限流与恢复', () => {
         expect(starts).toEqual([120, 1120, 3120, 7120]); expect(hosts()).toEqual([HTML, HTML, HTML, HTML]);
         expect(vi.getTimerCount()).toBe(0);
     });
-    it('长 Retry-After 立即让所有等待者获得安全 429，免费池可换服务且没有备用域名请求', async () => {
-        fetchMock.mockResolvedValue(response('<html>private original secret.example/key</html>', 429, {'Retry-After': '60'}));
+    it('长 Retry-After 立即让所有调用者获得安全 429，并且不在暂停后换线', async () => {
+        const starts: number[] = [];
+        fetchMock.mockImplementation(async () => {starts.push(Date.now());return response('<html>private original secret.example/key</html>', 429, {'Retry-After': '60'});});
         const failures = await flush(Promise.all([
             api.translateGoogleText('Private English', 'en', 'zh').catch(error => error),
             api.translateGoogleText('Private French', 'fr', 'zh').catch(error => error),
         ]));
         expect(failures).toEqual([expect.objectContaining({statusCode: 429, retryAfterMs: 60_000}), expect.objectContaining({statusCode: 429, retryAfterMs: 60_000})]);
         expect(failures.every(failure => !/Private|private original|secret.example/u.test(failure.message))).toBe(true);
-        expect(hosts()).toEqual([HTML]); expect(vi.getTimerCount()).toBe(0);
+        expect(hosts()).toEqual([HTML, LIST]);
+        expect(starts).toEqual([starts[0], starts[0]]);expect(vi.getTimerCount()).toBe(0);
     });
     it('迟到的旧 HTTP 成功不能清除新 429；恢复探测在途时其他语言继续等待', async () => {
         vi.setSystemTime(0);
@@ -461,11 +463,12 @@ describe('Google 所有入口共享限流与恢复', () => {
         const old = api.translateGoogleText('Old prose', 'en', 'zh');
         await vi.advanceTimersByTimeAsync(120);
         const limited = api.translateGoogleText('Limited prose', 'fr', 'zh');
-        await vi.advanceTimersByTimeAsync(150); expect(fetchMock).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(120); expect(fetchMock).toHaveBeenCalledTimes(2);
         resolveOld(response([['迟到旧译文']])); await expect(old).resolves.toBe('迟到旧译文');
         const queued = api.translateGoogleText('Queued prose', 'es', 'zh');
         await vi.advanceTimersByTimeAsync(999); expect(fetchMock).toHaveBeenCalledTimes(2);
-        await vi.advanceTimersByTimeAsync(201); expect(fetchMock).toHaveBeenCalledTimes(3);
+        await vi.advanceTimersByTimeAsync(1); expect(fetchMock).toHaveBeenCalledTimes(3);
+        await vi.advanceTimersByTimeAsync(200); expect(fetchMock).toHaveBeenCalledTimes(3);
         resolveProbe(response(['恢复译文']));
         await expect(limited).resolves.toBe('恢复译文');
         await expect(flush(queued)).resolves.toBe('最后译文');

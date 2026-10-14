@@ -72,8 +72,8 @@ describe('Google HTTP 退避与免费池/broker 集成', () => {
         expect(fetchMock).toHaveBeenCalledTimes(9);
         expect(fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body))[0][0].length)).toEqual([8, 8, 8, 8, 8, 8, 8, 8, 7]);
         expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(1000);
-        // 恢复探测属于第一组原 attempt；其旧 300ms 许可已过期，下一组仍受共享 HTTP 200ms 节奏约束。
-        expect(starts.slice(2).every((at, index) => at - starts[index + 1]! >= 200)).toBe(true);
+        // 恢复探测成功后下一组不再等待 HTTP 间隔；后续仍保留免费池自身的 owner 调度。
+        expect(starts[2]).toBe(starts[1]);
         expect(fetchMock.mock.calls.every(([input]) => new URL(String(input)).hostname === 'translate-pa.googleapis.com')).toBe(true);
     });
 

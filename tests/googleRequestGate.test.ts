@@ -6,6 +6,19 @@ afterEach(() => {expect(vi.getTimerCount()).toBe(0); vi.useRealTimers(); vi.rest
 const signal = () => new AbortController().signal;
 
 describe('Google 真实 HTTP 共享队列', () => {
+    it('starts four ready burst requests immediately and holds the fifth until a real lease finishes', async () => {
+        const gate = createGoogleRequestGate(GOOGLE_REQUEST_GATE_POLICIES.burst4);
+        const leases = await Promise.all(Array.from({length: 4}, () => gate.acquire(signal(), 5000)));
+        expect(Date.now()).toBe(0);
+        let fifthStarted = false;
+        const fifth = gate.acquire(signal(), 5000).then(lease => {fifthStarted = true;return lease;});
+        await vi.advanceTimersByTimeAsync(100);
+        expect(fifthStarted).toBe(false);
+        leases[0]!.finish(true);
+        const final = await fifth;
+        expect(Date.now()).toBe(100);
+        leases.slice(1).forEach(lease => lease.finish(true));final.finish(true);
+    });
     it('许可交付后的新 429 使旧许可失效；未发 HTTP 的取消不会消耗启动间隔', async () => {
         const gate = createGoogleRequestGate();
         const unpublished = await gate.acquire(signal(), 5000);

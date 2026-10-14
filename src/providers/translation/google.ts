@@ -47,7 +47,7 @@ const GOOGLE_BATCH_MAX_CHARACTERS = 10_000;
 const GOOGLE_BATCH_WINDOW_MS = 120;
 const GOOGLE_EXPLORATION_INTERVAL = 10;
 // Frozen experiment artifacts replace only this selector. Public builds stay at baseline.
-const GOOGLE_REQUEST_GATE_POLICY = GOOGLE_REQUEST_GATE_POLICIES.concurrent4;
+const GOOGLE_REQUEST_GATE_POLICY = GOOGLE_REQUEST_GATE_POLICIES.burst4;
 const googleRequestGate = createGoogleRequestGate(GOOGLE_REQUEST_GATE_POLICY);
 
 type EndpointHealth = {

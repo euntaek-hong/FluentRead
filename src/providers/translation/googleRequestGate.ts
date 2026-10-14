@@ -16,11 +16,12 @@ export interface GoogleRequestGatePolicy {
     minStartIntervalMs: number;
 }
 
-/** 保留受控比较的策略；Google adapter 使用已验证的四路策略。 */
+/** 保留受控比较策略；burst4 让已准备的独立请求立即占用四个真实 HTTP 槽。 */
 export const GOOGLE_REQUEST_GATE_POLICIES = {
     baseline: {maxConcurrentRequests: 2, minStartIntervalMs: 200},
     concurrent4: {maxConcurrentRequests: 4, minStartIntervalMs: 150},
     concurrent8: {maxConcurrentRequests: 8, minStartIntervalMs: 50},
+    burst4: {maxConcurrentRequests: 4, minStartIntervalMs: 0},
 } as const satisfies Record<string, GoogleRequestGatePolicy>;
 
 /** 等待预算耗尽不是某个 Google 端点的传输故障。 */
