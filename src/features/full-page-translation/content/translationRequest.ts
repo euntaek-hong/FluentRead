@@ -59,6 +59,13 @@ export function getTranslationInvocationIdentity(snapshot: FullPageTranslationCo
 export interface FullPageTranslationCacheEntry {
     promise: Promise<string | undefined>;
     settled: boolean;
+    nativeGooglePrime?: boolean;
+}
+
+/** Runtime이 post-materialization slot을 다시 검증한 뒤에만 쓰는 Google native prime 증명. */
+export interface NativeGooglePrimeProof {
+    origins: readonly string[];
+    invocationIdentity: string;
 }
 
 export interface FullPageTranslationRequestCacheEntry {
@@ -205,6 +212,17 @@ function throwIfAborted(signal?: AbortSignal): void {
 function shouldKeepOriginalSlot(origin: string, snapshot: FullPageTranslationConfigSnapshot): boolean {
     return Boolean(origin.trim())
         && shouldSkipTranslationForTarget(origin, snapshot.targetLanguage, snapshot.excludedLanguages);
+}
+
+/**
+ * Bulk viewport prime은 DOM 경로와 같은 slot 집합만 provider에 보낸다. 수식이나
+ * 제외 언어 slot은 내부 경로가 복원하므로, 하나라도 있으면 그 후보는 일반 경로에 둔다.
+ */
+export function canPrimeNativeGoogleSlots(
+    origins: readonly string[], snapshot: FullPageTranslationConfigSnapshot,
+): boolean {
+    const formula = /(?<!\$)\${3}(?!\$)[^$]+?\${3}(?!\$)/u;
+    return origins.every(origin => !shouldKeepOriginalSlot(origin, snapshot) && !formula.test(origin));
 }
 
 function restoreSkippedSlots(
@@ -487,8 +505,9 @@ function rememberTranslation(
     session: FullPageTranslationSessionCache,
     key: string,
     result: Promise<string | undefined>,
+    nativeGooglePrime = false,
 ): void {
-    const entry: FullPageTranslationCacheEntry = {promise: result, settled: false};
+    const entry: FullPageTranslationCacheEntry = {promise: result, settled: false, ...(nativeGooglePrime ? {nativeGooglePrime: true} : {})};
     session.translationSlotCache.delete(key);
     session.translationSlotCache.set(key, entry);
     while (session.translationSlotCache.size > FULL_PAGE_TRANSLATION_CACHE_LIMIT) {
@@ -788,7 +807,10 @@ async function translateArrayWithValidation(
     context = document.title,
     discourseContext?: string,
 ): Promise<string[]> {
-    const translations = await translateTextBatch([...origins], context,
+    // Google native HTML batch는 page title, discourse, glossary 문맥을 소비하지 않는다.
+    // 빈 안정 context를 broker까지 전달해 제목 변경이 durable item identity를 갈라놓지 않게 한다.
+    const providerContext = snapshot.service === services.google ? '' : context;
+    const translations = await translateTextBatch([...origins], providerContext,
         createSnapshotTranslateOptions(snapshot, {...options, discourseContext}));
     // 原生响应恢复只由 broker 在同一总 deadline 内执行；最终失败不得在前端重获预算。
     return supportsNativeTranslationBatch(snapshot.service)
@@ -806,6 +828,7 @@ async function translateTextSlotsDirectly(
     context = document.title,
     discourseContext?: string,
     flushNativePageBatch = false,
+    nativeGooglePrime = false,
 ): Promise<string[]> {
     throwIfAborted(signal);
     // 小模型直接翻译各槽，不要求模型复述结构标记；短链接借用段落正文检测语言。
@@ -829,7 +852,9 @@ async function translateTextSlotsDirectly(
             const cached = fullPageSession.translationSlotCache.get(key);
             // 未结算的逐槽 promise 仍属于创建它的整请求取消域。只复用稳定结果；
             // 完全相同的重挂请求由外层 request cache 安全合并并统计 waiter。
-            if (cached?.settled) {
+            // viewport Google prime이 만든 entry만 DOM lifecycle이 진행 중에도 기다린다.
+            // 일반 in-flight slot은 기존 취소 소유권 규칙을 유지한다.
+            if (cached && (cached.settled || cached.nativeGooglePrime === true)) {
                 resultPromises[index] = cached.promise;
                 continue;
             }
@@ -854,7 +879,7 @@ async function translateTextSlotsDirectly(
             );
             entries.forEach(({key, indexes}, entryIndex) => {
                 const result = providerRequest.then((translations) => translations?.[entryIndex]);
-                rememberTranslation(fullPageSession, key, result);
+                rememberTranslation(fullPageSession, key, result, nativeGooglePrime);
                 indexes.forEach((index) => {
                     resultPromises[index] = result;
                 });
@@ -891,6 +916,33 @@ async function translateTextSlotsDirectly(
     if (parsed?.length === origins.length) return parsed;
     onSlotProtocolInvalid?.();
     return translateSlotsIndividually(origins, snapshot, signal, queueSession, context, discourseContext);
+}
+
+/** viewport runtime이 수집한 exact Google slot을 한 request로 prime한다. DOM은 session slot cache를 소비한다. */
+export function primeNativeGooglePageSlots(
+    origins: readonly string[], snapshot: FullPageTranslationConfigSnapshot, session: FullPageTranslationSessionCache,
+    signal = session.requestSignal,
+): Promise<string[]> {
+    const queueSession = createTranslationQueueSession();
+    session.requestQueueSessions?.add(queueSession);
+    const request = translateTextSlotsDirectly(origins, snapshot, signal, queueSession, session,
+        undefined, document.title, undefined, true, true);
+    const release = () => {
+        session.requestQueueSessions?.delete(queueSession);
+    };
+    void request.then(release, release);
+    return request;
+}
+
+/** 검증된 prime proof는 formula/language 재분류 없이 이미 등록된 slot promise를 소비한다. */
+export function consumeNativeGooglePrimeProof(
+    proof: NativeGooglePrimeProof,
+    snapshot: FullPageTranslationConfigSnapshot,
+    signal: AbortSignal | undefined,
+    queueSession: TranslationQueueSession | undefined,
+    session: FullPageTranslationSessionCache | undefined,
+): Promise<string[]> {
+    return translateTextSlotsDirectly(proof.origins, snapshot, signal, queueSession, session);
 }
 
 async function translateTextSlotsInternal(
@@ -947,6 +999,13 @@ async function translateTextSlotsInternal(
     const requestOrigins = translatedIndexes.length === origins.length
         ? origins
         : translatedIndexes.map((index) => origins[index] ?? '');
+    // runtime이 exact viewport slots를 먼저 prime한 경우에는 outer request-cache key가
+    // 후보별로 달라도 prime-owned slot promise를 직접 소비한다.
+    if (fullPageSession?.active && requestOrigins.length > 0 && requestOrigins.every(origin =>
+        fullPageSession.translationSlotCache.get(createCacheKey(origin, snapshot))?.nativeGooglePrime === true,
+    )) {
+        return translateTextSlotsDirectly(origins, snapshot, signal, queueSession, fullPageSession);
+    }
     const isAICrossCandidateRequest = snapshot.enableAIMultiSegment
         && !supportsNativeTranslationBatch(snapshot.service)
         && servicesType.isUseAIContext(snapshot.service, snapshot.model)

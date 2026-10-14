@@ -23,7 +23,7 @@ import {getTranslationProviderConfig, getTranslationRequestScheduler, type Trans
 import type {TranslationRequestLease} from '@/src/services/translation/requestScheduler';
 import {isNativeTranslationBatchEnabled} from '@/src/core/config/nativeBatch';
 import {config} from '@/src/services/config/store';
-import {createGoogleRequestGate, googleRequestDeadlineError} from './googleRequestGate';
+import {createGoogleRequestGate, googleRequestDeadlineError, GOOGLE_REQUEST_GATE_POLICIES} from './googleRequestGate';
 import {isNativeBatchResponseError, NativeBatchResponseError} from '@/src/core/translation/nativeBatch';
 import {hasTranslationContent} from '@/src/core/translation/result';
 
@@ -45,9 +45,10 @@ const GOOGLE_FAILURE_COOLDOWN_MS = 30_000;
 const GOOGLE_BATCH_MAX_ITEMS = 32;
 const GOOGLE_BATCH_MAX_CHARACTERS = 10_000;
 const GOOGLE_BATCH_WINDOW_MS = 120;
-const GOOGLE_PAGE_BATCH_MIN_ITEMS = 10;
 const GOOGLE_EXPLORATION_INTERVAL = 10;
-const googleRequestGate = createGoogleRequestGate();
+// Frozen experiment artifacts replace only this selector. Public builds stay at baseline.
+const GOOGLE_REQUEST_GATE_POLICY = GOOGLE_REQUEST_GATE_POLICIES.concurrent4;
+const googleRequestGate = createGoogleRequestGate(GOOGLE_REQUEST_GATE_POLICY);
 
 type EndpointHealth = {
     retryAt: number; failures: number; version: number; statusCode?: number; probing: boolean;
@@ -551,16 +552,6 @@ function enqueueGoogleText(
     });
 }
 
-function pendingGoogleBatchSize(fromLang: string, toLang: string): {items: number; characters: number} {
-    return pendingTexts.reduce((total, item) => {
-        if (item.fromLang !== fromLang || item.toLang !== toLang) return total;
-        return {
-            items: total.items + 1,
-            characters: total.characters + escapeGoogleText(item.text).length + 11,
-        };
-    }, {items: 0, characters: 0});
-}
-
 /** 上层已限定组大小并保留纯空白槽；本入口只复用原端点排序/超时，不共享在途请求或信号。 */
 export function translateGoogleOwnerTexts(
     texts: readonly string[], fromLang: string, toLang: string, signal: AbortSignal, lease?: TranslationRequestLease,
@@ -605,14 +596,9 @@ export async function translateGoogleTexts(texts: readonly string[], fromLang: s
         }
         const requests = texts.map(text => enqueueGoogleText(text, googleLanguage(fromLang), googleLanguage(toLang),
             controller.signal, subscribeAbort, deadlineAt, lease, flushImmediately));
-        // 页面波次至少收齐十个短段后才提前提交。较小批次继续保留 120ms
-        // 窗口，让下一个 8ms discovery slice 能加入同一个 Google HTTP 请求。
-        // 页面波次会在调用方完成收集后才到达这里；循环中不允许满批提前发送，
-        // 使同一波次的所有文本按实际 HTML 转义字符数统一分组。
-        const pending = pendingGoogleBatchSize(googleLanguage(fromLang), googleLanguage(toLang));
-        if (texts.length >= GOOGLE_BATCH_MAX_ITEMS || (flushImmediately && (
-            pending.items >= GOOGLE_PAGE_BATCH_MIN_ITEMS || pending.characters >= GOOGLE_BATCH_MAX_CHARACTERS
-        ))) flushGoogleTexts();
+        // runtime이 exact viewport slot 수집을 끝낸 wave만 명시적으로 flush한다.
+        // 일반 호출은 여전히 120ms collector 창을 사용한다.
+        if (texts.length >= GOOGLE_BATCH_MAX_ITEMS || flushImmediately) flushGoogleTexts();
         return await Promise.all(requests);
     } catch (error) {
         controller.abort(error);

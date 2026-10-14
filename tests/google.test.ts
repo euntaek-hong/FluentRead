@@ -86,7 +86,7 @@ describe('Google 批量传输与换线', () => {
             .resolves.toEqual(['译文1', ' \n', '译文2']);
         expect(fetchMock.mock.calls.map(([url, init]) => requestData(url, init).texts.length)).toEqual([1, 1]);
         expect(starts[0]).toBe(start);
-        expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(200);
+        expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(150);
     });
     it('关闭合批的异步逐条链在入口复制来源，外部修改不能改变后续槽', async () => {
         const origins = ['Paragraph 1', 'Paragraph 2'];
@@ -138,7 +138,7 @@ describe('Google 批量传输与换线', () => {
         }
         await expect(flush(Promise.all(requests))).resolves.toEqual(Array.from({length: 20}, (_, index) => `译文${index}`));
         expect(fetchMock.mock.calls.map(([url, init]) => requestData(url, init).texts.length)).toEqual([4, 4, 4, 4, 4]);
-        expect(starts.slice(1).every((at, index) => at - starts[index]! >= 200)).toBe(true);
+        expect(starts.slice(1).every((at, index) => at - starts[index]! >= 150)).toBe(true);
     });
     it('显式大数组满批立即发送，尾批只等待 HTTP 节流，不再等待收集窗', async () => {
         fetchMock.mockImplementation(async (url, init) => successfulResponse(url,
@@ -151,25 +151,24 @@ describe('Google 批量传输与换线', () => {
         await expect(request).resolves.toEqual(sources.map((_, index) => `译文${index}`));
         expect(fetchMock.mock.calls.map(([url, init]) => requestData(url, init).texts.length)).toEqual([32, 32, 1]);
     });
-    it('全文 Google 页面波次先保留小 discovery slice，凑满十槽后一次提交已登记的所有文本', async () => {
+    it('全文 Google 页面 wave 在 runtime 完成 exact slot 收集后立即提交不足十槽的批次', async () => {
         fetchMock.mockImplementation(async (url, init) => successfulResponse(url,
             requestData(url, init).texts.map(text => `译文${text.match(/\d+/)![0]}`)));
-        const first = api.translateGoogleTexts(['Paragraph 1', 'Paragraph 2', 'Paragraph 3', 'Paragraph 4', 'Paragraph 5'], 'en', 'zh',
-            undefined, 2_000, true, undefined, true);
+        const first = api.translateGoogleTexts(['Paragraph 1', 'Paragraph 2', 'Paragraph 3'], 'en', 'zh',
+            undefined, 2_000, true, undefined, false);
         await vi.advanceTimersByTimeAsync(0);
         expect(fetchMock).not.toHaveBeenCalled();
 
-        const second = api.translateGoogleTexts(['Paragraph 6', 'Paragraph 7', 'Paragraph 8', 'Paragraph 9', 'Paragraph 10'], 'en', 'zh',
+        const second = api.translateGoogleTexts(['Paragraph 4', 'Paragraph 5'], 'en', 'zh',
             undefined, 2_000, true, undefined, true);
         await vi.advanceTimersByTimeAsync(0);
         expect(fetchMock).toHaveBeenCalledOnce();
         expect(requestData(...fetchMock.mock.calls[0]!).texts)
             .toEqual(['<pre>Paragraph 1</pre>', '<pre>Paragraph 2</pre>', '<pre>Paragraph 3</pre>',
-                '<pre>Paragraph 4</pre>', '<pre>Paragraph 5</pre>', '<pre>Paragraph 6</pre>',
-                '<pre>Paragraph 7</pre>', '<pre>Paragraph 8</pre>', '<pre>Paragraph 9</pre>', '<pre>Paragraph 10</pre>']);
+                '<pre>Paragraph 4</pre>', '<pre>Paragraph 5</pre>']);
         await expect(flush(Promise.all([first, second]))).resolves.toEqual([
-            ['译文1', '译文2', '译文3', '译文4', '译文5'],
-            ['译文6', '译文7', '译文8', '译文9', '译文10'],
+            ['译文1', '译文2', '译文3'],
+            ['译文4', '译文5'],
         ]);
     });
     it('普通 Google 调用即使到达两个小批次仍保留 120ms 收集窗', async () => {
@@ -394,20 +393,27 @@ describe('Google 所有入口共享限流与恢复', () => {
         vi.setSystemTime(0);
         let resolveFirst!: (value: Response) => void;
         let resolveSecond!: (value: Response) => void;
+        const releaseOthers: Array<() => void> = [];
         fetchMock.mockImplementationOnce(() => new Promise(resolve => {resolveFirst = resolve;}))
             .mockImplementationOnce(() => new Promise(resolve => {resolveSecond = resolve;}))
+            .mockImplementationOnce((url, init) => new Promise(resolve => {releaseOthers.push(() => resolve(successfulResponse(url, requestData(url, init).texts.map(() => '第三段'))));}))
+            .mockImplementationOnce((url, init) => new Promise(resolve => {releaseOthers.push(() => resolve(successfulResponse(url, requestData(url, init).texts.map(() => '第四段'))));}))
             .mockImplementation(async (url, init) => successfulResponse(url, requestData(url, init).texts.map(() => '恢复译文')));
         const first = api.translateGoogleOwnerTexts(['First'], 'en', 'zh', new AbortController().signal);
         const second = api.translateGoogleOwnerTexts(['Second'], 'fr', 'zh', new AbortController().signal);
         const third = api.translateGoogleOwnerTexts(['Third'], 'es', 'zh', new AbortController().signal);
-        await vi.advanceTimersByTimeAsync(400); expect(fetchMock).toHaveBeenCalledTimes(2);
+        const fourth = api.translateGoogleOwnerTexts(['Fourth'], 'ja', 'zh', new AbortController().signal);
+        const fifth = api.translateGoogleOwnerTexts(['Fifth'], 'de', 'zh', new AbortController().signal);
+        await vi.advanceTimersByTimeAsync(620); expect(fetchMock).toHaveBeenCalledTimes(4);
         resolveFirst(response([['第一段']])); await Promise.resolve();
         resolveSecond(response('', 429, {'Retry-After': '1'}));
         await vi.advanceTimersByTimeAsync(0);
         await expect(first).resolves.toEqual(['第一段']);
-        expect(fetchMock).toHaveBeenCalledTimes(2);
-        await expect(flush(Promise.all([second, third]))).resolves.toEqual([['恢复译文'], ['恢复译文']]);
         expect(fetchMock).toHaveBeenCalledTimes(4);
+        releaseOthers.forEach(release => release());
+        await expect(Promise.all([third, fourth])).resolves.toEqual([['第三段'], ['第四段']]);
+        await expect(flush(Promise.all([second, fifth]))).resolves.toEqual([['恢复译文'], ['恢复译文']]);
+        expect(fetchMock).toHaveBeenCalledTimes(6);
     });
     it('Retry-After 日期在到期前暂停所有语言与入口；恢复只重试原入口', async () => {
         vi.setSystemTime(0);
@@ -455,7 +461,7 @@ describe('Google 所有入口共享限流与恢复', () => {
         const old = api.translateGoogleText('Old prose', 'en', 'zh');
         await vi.advanceTimersByTimeAsync(120);
         const limited = api.translateGoogleText('Limited prose', 'fr', 'zh');
-        await vi.advanceTimersByTimeAsync(200); expect(fetchMock).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(150); expect(fetchMock).toHaveBeenCalledTimes(2);
         resolveOld(response([['迟到旧译文']])); await expect(old).resolves.toBe('迟到旧译文');
         const queued = api.translateGoogleText('Queued prose', 'es', 'zh');
         await vi.advanceTimersByTimeAsync(999); expect(fetchMock).toHaveBeenCalledTimes(2);

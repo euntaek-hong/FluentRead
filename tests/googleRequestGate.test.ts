@@ -1,5 +1,5 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
-import {createGoogleRequestGate, type GoogleHttpLease} from '@/src/providers/translation/googleRequestGate';
+import {createGoogleRequestGate, GOOGLE_REQUEST_GATE_POLICIES, type GoogleHttpLease} from '@/src/providers/translation/googleRequestGate';
 
 beforeEach(() => {vi.useFakeTimers(); vi.setSystemTime(0);});
 afterEach(() => {expect(vi.getTimerCount()).toBe(0); vi.useRealTimers(); vi.restoreAllMocks();});
@@ -44,6 +44,23 @@ describe('Google 真实 HTTP 共享队列', () => {
         // 重复归还不得多释放容量；另两个实际传输仍占有许可。
         first.finish(true);
         await two; second.finish(true); third.finish(true);
+    });
+
+    it('实验策略只提高真实 HTTP 许可数量，独立请求仍按最小启动间隔 FIFO 发出', async () => {
+        const gate = createGoogleRequestGate(GOOGLE_REQUEST_GATE_POLICIES.concurrent4);
+        const starts: number[] = [];
+        const leases: GoogleHttpLease[] = [];
+        const acquire = () => gate.acquire(signal(), 10_000).then(lease => {
+            starts.push(Date.now()); leases.push(lease);
+        });
+        const waiting = [acquire(), acquire(), acquire(), acquire(), acquire()];
+        await vi.advanceTimersByTimeAsync(450);
+        expect(starts).toEqual([0, 150, 300, 450]);
+        // 네 번째 transport가 아직 끝나지 않아 다섯 번째는 outer task 수와 무관하게 대기한다.
+        await vi.advanceTimersByTimeAsync(300); expect(starts).toHaveLength(4);
+        leases[0]!.finish(true); await waiting[4];
+        expect(starts).toEqual([0, 150, 300, 450, 750]);
+        leases.slice(1).forEach(lease => lease.finish(true));
     });
 
     it('等待者取消立即清理计时器/监听器，已取消调用不进入队列', async () => {

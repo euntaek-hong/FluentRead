@@ -18,9 +18,12 @@ import type {TranslationQueueSession} from '@/src/services/translation/queue';
 import {copyFullPageTranslationConfigSnapshot} from './translationConfigSnapshot';
 import {isPersonalCorrectionEnabled, lookupPersonalCorrection, type PersonalCorrectionSnapshot} from './personalCorrections';
 import {
+    consumeNativeGooglePrimeProof,
+    getTranslationInvocationIdentity,
     translateTextSlots,
     type FullPageTranslationConfigSnapshot,
     type FullPageTranslationSessionCache,
+    type NativeGooglePrimeProof,
 } from './translationRequest';
 
 export interface LiveTextTranslationResult {
@@ -185,6 +188,7 @@ export async function createTranslationRequest(
     protectionOptions?: TranslationTextProtectionOptions,
     forceFailedRequest = false,
     scope?: TranslationScope,
+    nativeGooglePrimeProof?: NativeGooglePrimeProof,
 ): Promise<TranslationResult> {
     snapshot = copyFullPageTranslationConfigSnapshot(snapshot);
     const controlValueAttribute = getTranslatableControlValueAttribute(node);
@@ -200,6 +204,14 @@ export async function createTranslationRequest(
         undefined, protectionOptions);
     const origins = parts.map((part) => part.source);
     if (origins.length === 0) return {kind: 'snapshot', sources: [], translations: []};
+    const hasMatchingPrimeProof = nativeGooglePrimeProof
+        && nativeGooglePrimeProof.invocationIdentity === getTranslationInvocationIdentity(snapshot)
+        && nativeGooglePrimeProof.origins.length === origins.length
+        && nativeGooglePrimeProof.origins.every((origin, index) => origin === origins[index]);
+    if (hasMatchingPrimeProof) {
+        const translations = await consumeNativeGooglePrimeProof(nativeGooglePrimeProof, snapshot, signal, queueSession, fullPageSession);
+        return {kind: 'snapshot', sources: origins, translations};
+    }
     let source: string | null = null;
     if (origins.length > 1 || (import.meta.env.BROWSER !== 'userscript' && isPersonalCorrectionEnabled())) {
         const core = getCurrentTranslationCore(scope);

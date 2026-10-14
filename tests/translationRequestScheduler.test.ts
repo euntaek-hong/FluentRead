@@ -53,6 +53,66 @@ describe('translation request scheduler', () => {
         await expect(Promise.all(jobs)).resolves.toEqual([0, 1, 2]);
     });
 
+    it.each([10, 20, 40])('global %i keeps that many independent provider transports in flight', async maxConcurrentTranslations => {
+        const scheduler = createTranslationRequestScheduler(() => ({
+            maxConcurrentTranslations, translationRequestsPerSecond: 0, translationRequestsPerMinute: 0,
+        }));
+        const sources = Array.from({length: maxConcurrentTranslations + 1}, (_, index) => `source-${index}`);
+        const transports: ReturnType<typeof deferred<void>>[] = [];
+        const started: Array<{source: string; service: string}> = [];
+        const jobs = sources.map((source, index) => scheduler.schedule(async lease => {
+            const transport = deferred<void>();
+            transports[index] = transport;
+            lease.holdUntil(transport.promise);
+            const service = index % 2 === 0 ? 'microsoft' : 'aiSdk';
+            started.push({source, service});
+            return source;
+        }, {identity: index % 2 === 0
+            ? {service: 'microsoft', model: 'default'}
+            : {service: 'aiSdk', model: 'generic'}}));
+
+        sources.fill('mutated-after-schedule');
+        await flushMicrotasks();
+        expect(started).toEqual(Array.from({length: maxConcurrentTranslations}, (_, index) => ({
+            source: `source-${index}`, service: index % 2 === 0 ? 'microsoft' : 'aiSdk',
+        })));
+        transports[0]!.resolve();
+        await flushMicrotasks();
+        expect(started.at(-1)).toEqual({source: `source-${maxConcurrentTranslations}`, service: 'microsoft'});
+        transports.forEach(transport => transport?.resolve());
+        await expect(Promise.all(jobs)).resolves.toEqual(Array.from({length: maxConcurrentTranslations + 1}, (_, index) => `source-${index}`));
+    });
+
+    it('service and model concurrency overrides stay below an enlarged global transport cap', async () => {
+        const limits = (maxConcurrentTranslations: number) => ({maxConcurrentTranslations, translationRequestsPerSecond: 0, translationRequestsPerMinute: 0});
+        const scheduler = createTranslationRequestScheduler(() => ({
+            ...limits(40),
+            serviceRequestLimits: {microsoft: {enabled: true, limits: limits(1)}},
+            modelRequestLimits: {aiSdk: {generic: {enabled: true, limits: limits(2)}}},
+        }));
+        const transports: ReturnType<typeof deferred<void>>[] = [];
+        const started: string[] = [];
+        const schedule = (name: string, identity: {service: string; model: string}) => scheduler.schedule(async lease => {
+            const transport = deferred<void>();
+            transports.push(transport);
+            lease.holdUntil(transport.promise);
+            started.push(name);
+            return name;
+        }, {identity});
+        const jobs = [
+            schedule('microsoft-1', {service: 'microsoft', model: 'default'}),
+            schedule('microsoft-2', {service: 'microsoft', model: 'default'}),
+            schedule('ai-1', {service: 'aiSdk', model: 'generic'}),
+            schedule('ai-2', {service: 'aiSdk', model: 'generic'}),
+            schedule('ai-3', {service: 'aiSdk', model: 'generic'}),
+        ];
+
+        await flushMicrotasks();
+        expect(started).toEqual(['microsoft-1', 'ai-1', 'ai-2']);
+        transports.forEach(transport => transport.resolve());
+        await expect(Promise.all(jobs)).resolves.toEqual(['microsoft-1', 'microsoft-2', 'ai-1', 'ai-2', 'ai-3']);
+    });
+
     it('同时执行每秒和每分钟滑动窗口限制', async () => {
         const config = {
             maxConcurrentTranslations: 10,

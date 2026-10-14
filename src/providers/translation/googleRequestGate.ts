@@ -1,7 +1,7 @@
 /**
  * @file src/providers/translation/googleRequestGate.ts
  * 文件职责：约束 Google 匿名翻译的真实 HTTP 启动，并在任一入口限流时暂停整个 Google 请求队列。
- * 主要内容：以 FIFO、两路在途和 200 毫秒启动间隔调度传输；保留服务端 Retry-After，缺省使用有界指数退避；冷却后只发一个恢复探测，通过版本隔离迟到成功，按调用方绝对截止时间和取消信号清理等待。
+ * 主要内容：以 FIFO 和显式策略约束在途数及启动间隔；保留服务端 Retry-After，缺省使用有界指数退避；冷却后只发一个恢复探测，通过版本隔离迟到成功，按调用方绝对截止时间和取消信号清理等待。
  * 模块边界：仅持有 Google 传输的规模与健康状态，不存储原文、不选择端点、不访问浏览器或网络；适配器在真实 HTTP 完成后归还许可。
  */
 import {abortErrorFromSignal} from '@/src/platform/http/runtime';
@@ -10,6 +10,18 @@ export interface GoogleHttpLease {
     isCurrent(): boolean;
     finish(success: boolean, dispatched?: boolean): void;
 }
+
+export interface GoogleRequestGatePolicy {
+    maxConcurrentRequests: number;
+    minStartIntervalMs: number;
+}
+
+/** 保留受控比较的策略；Google adapter 使用已验证的四路策略。 */
+export const GOOGLE_REQUEST_GATE_POLICIES = {
+    baseline: {maxConcurrentRequests: 2, minStartIntervalMs: 200},
+    concurrent4: {maxConcurrentRequests: 4, minStartIntervalMs: 150},
+    concurrent8: {maxConcurrentRequests: 8, minStartIntervalMs: 50},
+} as const satisfies Record<string, GoogleRequestGatePolicy>;
 
 /** 等待预算耗尽不是某个 Google 端点的传输故障。 */
 export function googleRequestDeadlineError(): Error {
@@ -24,7 +36,7 @@ interface WaitingRequest {
 }
 
 /** 所有入口共用一份实例；上层预算不足时保留准确限流身份，供免费池切换其他供应商。 */
-export function createGoogleRequestGate() {
+export function createGoogleRequestGate(policy: GoogleRequestGatePolicy = GOOGLE_REQUEST_GATE_POLICIES.baseline) {
     const pending: WaitingRequest[] = [];
     let active = 0;
     let nextStartAt = 0;
@@ -56,11 +68,11 @@ export function createGoogleRequestGate() {
                 entry.reject(failures > 0 ? rateLimitError() : googleRequestDeadlineError());
             }
         }
-        while (pending.length && active < 2 && !probing && Math.max(nextStartAt, retryAt) <= now) {
+        while (pending.length && active < policy.maxConcurrentRequests && !probing && Math.max(nextStartAt, retryAt) <= now) {
             const entry = pending.shift()!;
             entry.cleanup();
             active += 1;
-            nextStartAt = now + 200;
+            nextStartAt = now + policy.minStartIntervalMs;
             const leaseSequence = ++sequence;
             const leaseVersion = version;
             const recovery = failures > 0;
@@ -84,7 +96,7 @@ export function createGoogleRequestGate() {
         }
         if (!pending.length) return;
         const deadline = Math.min(...pending.map(entry => entry.deadlineAt));
-        const readyAt = active >= 2 || probing ? deadline : Math.min(deadline, Math.max(nextStartAt, retryAt));
+        const readyAt = active >= policy.maxConcurrentRequests || probing ? deadline : Math.min(deadline, Math.max(nextStartAt, retryAt));
         timer = setTimeout(drain, Math.max(1, readyAt - now));
     }
 

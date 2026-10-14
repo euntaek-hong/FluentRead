@@ -4,6 +4,9 @@ const runtime = vi.hoisted(() => ({
     slots: [] as Array<{node: Text; prefix: string; source: string; suffix: string}>,
     translations: [] as string[],
     translateTextSlots: vi.fn(),
+    consumeNativeGooglePrimeProof: vi.fn(),
+    personalCorrection: undefined as {translation?: string} | undefined,
+    personalCorrectionEnabled: false,
     getCurrentTranslationCore: vi.fn(() => ({shouldStayOriginal: () => false})),
 }));
 
@@ -23,6 +26,12 @@ vi.mock('@/src/core/translation/public', async (importOriginal) => {
 
 vi.mock('@/src/features/full-page-translation/content/translationRequest', () => ({
     translateTextSlots: runtime.translateTextSlots,
+    consumeNativeGooglePrimeProof: runtime.consumeNativeGooglePrimeProof,
+    getTranslationInvocationIdentity: () => 'frozen-invocation',
+}));
+vi.mock('@/src/features/full-page-translation/content/personalCorrections', () => ({
+    isPersonalCorrectionEnabled: () => runtime.personalCorrectionEnabled,
+    lookupPersonalCorrection: async () => runtime.personalCorrection,
 }));
 
 import {parseHTML} from 'linkedom';
@@ -37,6 +46,10 @@ describe('实时文本翻译快照', () => {
     beforeEach(() => {
         runtime.slots = [];
         runtime.translations = [];
+        runtime.personalCorrection = undefined;
+        runtime.personalCorrectionEnabled = false;
+        runtime.consumeNativeGooglePrimeProof.mockReset();
+        runtime.consumeNativeGooglePrimeProof.mockImplementation(async () => runtime.translations);
         runtime.translateTextSlots.mockReset();
         runtime.translateTextSlots.mockImplementation(async () => runtime.translations);
     });
@@ -304,5 +317,39 @@ describe('目标语言排版回显保持网页原文', () => {
         const result = await createTranslationRequest(owner, 'content', mode, active);
         if (result.kind === 'live-text') expect(result.changed).toBe(false);
         expect(owner.textContent).toBe(source);
+    });
+});
+
+describe('Google prime proof follows exact frozen source slots', () => {
+    it.each([
+        {identity: 'frozen-invocation', origins: ['Source'], match: true},
+        {identity: 'older-invocation', origins: ['Source'], match: false},
+        {identity: 'frozen-invocation', origins: ['Source', 'Extra'], match: false},
+        {identity: 'frozen-invocation', origins: ['Changed'], match: false},
+    ])('validates invocation and each source slot: $identity/$origins', async ({identity, origins, match}) => {
+        const {document} = parseHTML('<html><body><p>Source</p></body></html>');const node = document.querySelector('p')!;
+        runtime.personalCorrection = undefined;runtime.consumeNativeGooglePrimeProof.mockClear();runtime.translateTextSlots.mockClear();
+        runtime.translations = ['译:Source'];runtime.slots = [{node: node.firstChild as Text, prefix:'', source:'Source', suffix:''}];
+        const result = await createTranslationRequest(node, 'content', 'bilingual', snapshot, undefined, undefined, undefined,
+            undefined, false, undefined, {invocationIdentity:identity, origins});
+        expect(result).toMatchObject({sources:['Source'],translations:['译:Source']});
+        expect(runtime.consumeNativeGooglePrimeProof.mock.calls.length).toBe(match?1:0);
+        expect(runtime.translateTextSlots.mock.calls.length).toBe(match?0:1);
+    });
+    it('returns a saved correction without sending the original source again', async () => {
+        const {document} = parseHTML('<html><body><p>First <b>Second</b></p></body></html>');const node = document.querySelector('p')!;
+        runtime.slots = collectRealSlots(node, () => false);runtime.personalCorrection = {translation:'Saved correction'};
+        runtime.translateTextSlots.mockClear();
+        const result = await createTranslationRequest(node, 'content', 'bilingual', snapshot);
+        expect(result.translations).toEqual(['Saved correction','']);expect(runtime.translateTextSlots).not.toHaveBeenCalled();
+        runtime.personalCorrection = undefined;
+    });
+    it.each(['<p>Only text.</p>', '<p><b>Only text.</b></p>'])('captures a baseline only when the single-slot source can preserve its structure: %s', async html => {
+        const {document} = parseHTML(`<html><body>${html}</body></html>`);const node = document.querySelector('p')!;
+        runtime.slots = collectRealSlots(node, () => false);runtime.personalCorrectionEnabled = true;
+        runtime.personalCorrection = {};runtime.translations = ['Only translated.'];
+        const result = await createTranslationRequest(node, 'content', 'bilingual', snapshot);
+        expect(result.personalCorrection).toEqual(html.includes('<b>') ? undefined : {baseline:['Only translated.']});
+        runtime.personalCorrection = undefined;runtime.personalCorrectionEnabled = false;
     });
 });
