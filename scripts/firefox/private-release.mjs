@@ -78,7 +78,7 @@ export async function sanitizeSources(bytes, buildInfo) {
         'Private identity is applied to a staging copy; the upstream manifest stays intact.',
         'Windows extension-only setup (documentation image tools are not needed):',
         '```', 'npx --yes pnpm@9.12.1 install --frozen-lockfile --ignore-scripts',
-        'node node_modules/esbuild/install.js',
+        'node -e "const path=require(\'node:path\'); const fs=require(\'node:fs\'); const req=require(\'node:module\').createRequire(fs.realpathSync(\'node_modules/vite/package.json\')); require(path.join(path.dirname(req.resolve(\'esbuild/package.json\')),\'install.js\'))"',
         'npx --yes pnpm@9.12.1 exec wxt prepare',
         'npx --yes pnpm@9.12.1 firefox:package -- --reproduce', '```',
         'No AMO credentials are needed to reproduce the unsigned ZIP.',

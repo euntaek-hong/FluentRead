@@ -5,8 +5,11 @@
     {"commit": "5a7bbbba", "issue": "Windows local Node CLI execution", "status": "local"},
     {"commit": "2f392d37", "issue": "Windows OCR public asset separators", "status": "local"},
     {"commit": "bb4c4ba9", "issue": "Windows userscript compression and lexical module paths", "status": "local"},
-    {"commit": "b1689474", "issue": "Independent native inputs, ready-wave flush, Google 4/150 request gate", "status": "local"},
+    {"commit": "b1689474", "issue": "Independent native inputs and ready-wave flush; original 4/150 gate superseded by 594d1245", "status": "local"},
     {"commit": "bab2dea7", "issue": "Atomic visible-screen commits, bounded four-wave preparation, fullpage spinner removal, personal 20/40 preset", "status": "local"},
-    {"commit": "355a73c6", "issue": "Complete viewport membership across nonmonotone sidebar/article DOM order; no below-viewport early seal", "status": "local"}
+    {"commit": "355a73c6", "issue": "Complete viewport membership across nonmonotone sidebar/article DOM order; no below-viewport early seal", "status": "local"},
+    {"commit": "594d1245", "issue": "Four real Google HTTP leases without artificial start gaps; global 429 recovery preserved", "status": "local"},
+    {"commit": "6352fc80", "issue": "Immediate initial discovery, 1200px initial nearby admission, separate visible/prefetch primes", "status": "local"},
+    {"commit": "1422c2a5", "issue": "Native synchronized pending opacity with per-member cleanup, no result fade or spinner", "status": "local"}
   ]
 }

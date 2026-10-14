@@ -63,7 +63,7 @@
 - `origin`은 `euntaek-hong/FluentRead`, `upstream`은 `FluentRead/FluentRead`입니다. `main`은 업스트림을 따라가고 개인 수정은 `codex/firefox-local`에서 관리합니다. 업스트림 PR이나 정기 자동 업데이트는 만들지 않습니다.
 - 프로젝트 명령은 `npx --yes pnpm@9.12.1 <명령>`으로 실행할 수 있습니다. pnpm 전역 설치나 의존성 업그레이드는 필요하지 않습니다.
 - 브라우저와 GUI 자동화는 기존 실행기를 재사용해 별도 Win32 desktop object에서 실행합니다. 그 안에서 브라우저는 `headful`을 유지합니다. 숨기기 위해 `headless`로 변경하지 않습니다. 사용자 desktop으로 전환하지 않습니다. 사용자 화면과 작업 표시줄에 자동화 창이 나타나거나 깜빡이지 않게 합니다. 포커스를 가져오지 않습니다. CDP/Marionette로 페이지를 조작하며 전역 키보드 입력은 사용하지 않습니다.
-- Windows 확장 전용 설치에서 문서용 이미지 바이너리 설치가 실패하면 `install --frozen-lockfile --ignore-scripts`를 사용합니다. 이후 `node node_modules/esbuild/install.js`와 `exec wxt prepare`를 실행합니다. TLS 검사를 완화하지 않습니다.
+- Windows 확장 전용 설치에서 문서용 이미지 바이너리 설치가 실패하면 `install --frozen-lockfile --ignore-scripts`를 사용합니다. Vite에서 실제로 사용하는 esbuild 패키지의 `install.js`를 실행합니다. 소스 ZIP의 `FIREFOX-PERSONAL-BUILD.md`에 재현 명령이 있습니다. 이후 `exec wxt prepare`를 실행합니다. TLS 검사를 완화하지 않습니다.
 
 ### 업데이트 요청 시 체크리스트
 
@@ -80,10 +80,13 @@
 ### 번역 성능 패치 점검
 
 - Google의 `translation-only` 경로는 실제 native provider와 기존 원문 복원 기능을 사용합니다. 서비스 이름만 보고 시작을 거부하거나 quick profile을 강제로 bilingual로 바꾸지 않습니다. 업스트림에서도 이 동작을 지원하면 개인 호환 패치를 제거합니다.
-- Google native HTTP는 escaped HTML 기준 32 text slots와 10,000자 경계를 따릅니다. 화면의 원문 입력을 하나의 문자열로 합치지 않습니다. 준비 작업은 최대 네 묶음인 128 slots와 40,000자로 제한합니다. AI의 4 slots와 2,000자 정책은 유지합니다. 실제 Google HTTP는 4개 동시 요청과 150ms 시작 간격을 사용합니다. 429의 전체 queue 중단과 단일 회복 probe를 유지합니다.
+- Google native HTTP는 escaped HTML 기준 32 text slots와 10,000자 경계를 따릅니다. 화면의 원문 입력을 하나의 문자열로 합치지 않습니다. 준비 작업은 최대 네 묶음인 128 slots와 40,000자로 제한합니다. AI의 4 slots와 2,000자 정책은 유지합니다. 실제 Google HTTP는 4개 동시 요청을 허용합니다. 준비된 요청에는 인위적인 시작 간격을 적용하지 않습니다. 429의 전체 queue 중단과 단일 회복 probe를 유지합니다.
 - `viewport`의 요청 준비와 DOM lifecycle을 분리합니다. 기존 IO pending plan만 사용하며 준비 중인 요청과 아직 소비하지 않은 결과에 상한을 둡니다. 먼 영역에는 wrapper나 spinner를 만들지 않습니다. 후보가 prefetch 범위를 벗어나면 소비하지 않은 준비를 취소합니다. 공유 요청의 다른 소유자는 유지합니다.
 - 원문 변경과 SPA 전환을 기준으로 요청 유효성을 검사합니다. Google native 요청은 provider가 사용하지 않는 제목 때문에 중복 요청하지 않습니다. AI와 다른 서비스의 context identity는 유지합니다. 원문 복원은 기존 text node와 inline 구조를 보존해야 합니다.
 - `viewport`는 현재 화면의 고정 그룹을 결산한 뒤 유효한 결과를 한 DOM transaction으로 반영합니다. 개별 full-page spinner는 표시하지 않습니다. staging은 요청 준비 점유만 반환합니다. DOM에 반영하기 전에는 완료로 기록하거나 후보를 삭제하지 않습니다. 반복 IO가 staged 후보를 다시 dispatch하지 않아야 합니다. 취소한 그룹의 결과는 이후 DOM에 반영하지 않습니다.
+- `viewport` 초기 탐색은 50ms mutation debounce를 기다리지 않습니다. 탐색은 계속 8ms slice를 사용합니다. 첫 관찰 콜백이 먼저 도착해도 화면 위아래 1,200px 후보를 초기 queue에 넣습니다. 실제 화면의 Google prime과 주변 prefetch prime은 별도 promise를 등록합니다. 주변의 느린 응답이 현재 화면 commit을 막아서는 안 됩니다. 먼 영역에는 요청이나 번역 DOM을 만들지 않습니다. 짧은 페이지가 전체 번역처럼 보이는 이유는 이 관찰 범위이며 문자 수로 `all` 모드로 바꾸지 않습니다.
+- 대기 중인 화면 그룹은 원본 class/style/DOM을 바꾸지 않는 동기화된 opacity pulse를 사용합니다. `animations=false`와 reduced-motion에서는 생략합니다. 실패, 취소, SPA 전환, 원문 복원, 그룹 완료 시 animation을 취소합니다. 번역 결과 표시에는 animation 대기가 없습니다. 이것은 개인 UX 효과이며 Trancy의 skeleton CSS를 복사한 구현이 아닙니다.
+- 이 패치의 업데이트 회귀에는 `tests/viewportPendingMotion.test.ts`, `tests/googleRequestGate.test.ts`, `tests/google.test.ts`, `tests/googleBackoffIntegration.test.ts`, `tests/fullPageVisibilityScheduling.test.ts`, `tests/fullPagePriority.test.ts`를 포함합니다. 초기 prefetch와 느린 prefetch의 화면 비차단을 확인합니다. 동시 요청의 429 회복과 animation 해제도 확인합니다. 관련 변경 모듈의 네 coverage 지표는 100%를 유지합니다.
 - 개인 ID의 업데이트에서 기존 공통 기본값 10개와 초당 10개를 한 번 20개와 초당 40개로 갱신합니다. 기존 `all` 설정은 이번 개선 대상인 `viewport`로 선택합니다. 사용자가 별도로 정한 요청 값과 서비스/모델 override는 유지합니다. 적용 marker를 기록하므로 이후 사용자 설정을 다시 변경하지 않습니다.
 - 업스트림 업데이트 시 아래 회귀 명령을 실행합니다. 구현 문자열보다 요청 묶음과 취소 동작을 기준으로 개인 패치의 필요성을 판단합니다.
 
