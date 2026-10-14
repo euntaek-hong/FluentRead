@@ -79,6 +79,12 @@
 
 ### 번역 성능 패치 점검
 
+- `1.0.5`는 기존 opacity pulse와 화면 일괄 전환을 유지합니다. 현재 화면의 고정 그룹을 먼저 준비하고 주변 prefetch는 그룹 결산 후 진행합니다. 대기 중인 그룹 구성원이 nearby로 이동해도 해당 작업을 끝냅니다. 오래 기다린 background 작업의 공정성 우선순위가 현재 그룹을 막으면 안 됩니다. 현재 그룹이 끝나면 새 dispatch plan으로 주변 작업을 재개합니다.
+- 새 팝업의 기존 우선순위는 화면 그룹보다 먼저 적용합니다. 본문 그룹에 staged/in-flight/pending 구성원이 남아 있어도 팝업 번역을 시작해야 합니다. 팝업을 닫으면 본문 작업을 이어갑니다.
+- Google 준비 후보는 DOM lifecycle 직전에 얻은 live Text 슬롯을 같은 동기 dispatch의 요청 생성에서 재사용합니다. invocation identity와 각 origin을 확인합니다. 현재 노드의 소속과 값이 다르면 슬롯을 다시 수집합니다. 응답 반영 전 원문/보호 경계/세션 검증은 그대로 유지합니다. 비준비 후보와 synthetic/control/hover 경로는 기존 수집을 사용합니다.
+- 초기 atomic viewport의 Google wave와 viewport queue에서 같은 원문을 중복으로 추출하지 않습니다. 최초 문서 탐색 완료와 비단조 DOM의 화면 구성원 확정은 유지합니다. 이 최적화는 초기 탐색을 생략하는 구현이 아닙니다.
+- 업데이트 회귀에 `tests/liveTextTranslation.test.ts`의 forwarded-slot fallback과 `tests/fullPageVisibilityScheduling.test.ts`의 visible-before-near, moved reserved member, aged distant task 검사를 포함합니다. 실제 시간 비교에는 profiler/coverage를 끕니다. 캐시 없는 실행과 캐시 있는 실행을 나눠 이전 개인 버전과 비교합니다.
+
 - Google의 `translation-only` 경로는 실제 native provider와 기존 원문 복원 기능을 사용합니다. 서비스 이름만 보고 시작을 거부하거나 quick profile을 강제로 bilingual로 바꾸지 않습니다. 업스트림에서도 이 동작을 지원하면 개인 호환 패치를 제거합니다.
 - Google native HTTP는 escaped HTML 기준 32 text slots와 10,000자 경계를 따릅니다. 화면의 원문 입력을 하나의 문자열로 합치지 않습니다. 준비 작업은 최대 네 묶음인 128 slots와 40,000자로 제한합니다. AI의 4 slots와 2,000자 정책은 유지합니다. 실제 Google HTTP는 4개 동시 요청을 허용합니다. 준비된 요청에는 인위적인 시작 간격을 적용하지 않습니다. 429의 전체 queue 중단과 단일 회복 probe를 유지합니다.
 - `viewport`의 요청 준비와 DOM lifecycle을 분리합니다. 기존 IO pending plan만 사용하며 준비 중인 요청과 아직 소비하지 않은 결과에 상한을 둡니다. 먼 영역에는 wrapper나 spinner를 만들지 않습니다. 후보가 prefetch 범위를 벗어나면 소비하지 않은 준비를 취소합니다. 공유 요청의 다른 소유자는 유지합니다.

@@ -10,6 +10,8 @@
     {"commit": "355a73c6", "issue": "Complete viewport membership across nonmonotone sidebar/article DOM order; no below-viewport early seal", "status": "local"},
     {"commit": "594d1245", "issue": "Four real Google HTTP leases without artificial start gaps; global 429 recovery preserved", "status": "local"},
     {"commit": "6352fc80", "issue": "Immediate initial discovery, 1200px initial nearby admission, separate visible/prefetch primes", "status": "local"},
-    {"commit": "1422c2a5", "issue": "Native synchronized pending opacity with per-member cleanup, no result fade or spinner", "status": "local"}
+    {"commit": "1422c2a5", "issue": "Native synchronized pending opacity with per-member cleanup, no result fade or spinner", "status": "local"},
+    {"commit": "43514d4d", "issue": "Reuse fresh dispatch text slots only with exact native prime identity, source and node validation", "status": "local"},
+    {"commit": "09262239", "issue": "Visible-group preparation before nearby work, no duplicate initial source extraction; moved members, fairness and modal priority preserved", "status": "local"}
   ]
 }
