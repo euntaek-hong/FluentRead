@@ -271,6 +271,8 @@ const BUILD_ONLY_SRC_ALLOWLIST = new Set([
     'src/features/full-page-translation/content/state.ts',
     // 全文翻译内容脚本 runtime 绑定页面 DOM、MutationObserver 与 WXT 翻译 glue；纯状态/布局/渲染已单独纳入 strict coverage。
     'src/features/full-page-translation/content/runtime.ts',
+    // 从上述浏览器 glue 原样拆出的 MutationObserver/DOM 生命周期组合；仍由全文来源、恢复、动态页面功能回归与隔离浏览器验证。
+    'src/features/full-page-translation/content/mutationRuntime.ts',
     // 视频字幕内容脚本 runtime 绑定 YouTube 播放器 DOM、浏览器消息与字幕下载流程；YouTube 数据逻辑已单独纳入 strict coverage。
     'src/features/video-subtitle/content/runtime.ts',
     // 平台字幕适配器绑定真实 DOM、TextTrack 与 Shadow DOM；专属生命周期单测及生产扩展浏览器夹具验证。

@@ -3,6 +3,7 @@
   "privateBranch": "codex/firefox-local",
   "patches": [
     {"commit": "5a7bbbba", "issue": "Windows local Node CLI execution", "status": "local"},
-    {"commit": "2f392d37", "issue": "Windows OCR public asset separators", "status": "local"}
+    {"commit": "2f392d37", "issue": "Windows OCR public asset separators", "status": "local"},
+    {"commit": "bb4c4ba9", "issue": "Windows userscript compression and lexical module paths", "status": "local"}
   ]
 }

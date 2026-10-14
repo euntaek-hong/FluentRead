@@ -53,27 +53,51 @@
 - 使用 `pnpm compile` 做 TypeScript/Vue 类型检查。
 - 涉及扩展构建或入口行为时同时运行 `pnpm build` 与 `pnpm build:firefox`；共享翻译或平台代码还要运行 `pnpm build:userscript` 和 userscript verifier。
 - 涉及文档时运行 `pnpm docs:build`。
-- `pnpm test:regression:all` 执行确定性的一键回归。真实浏览器层必须显式开启，使用临时 profile、屏幕外正常尺寸窗口和 focus-safe helper；不得连接用户日常 profile、最小化窗口或调用 `bringToFront()`。
+- `pnpm test:regression:all` 执行确定性的一键回归。真实浏览器层必须显式开启，使用临时 profile、独立 Win32 desktop object 中的 headful 窗口；不得连接用户日常 profile、切换用户 desktop、最小化窗口或调用 `bringToFront()`。
 - 自动化按键名称使用标准 `Control`，不要使用 `CTRL`；浏览器报告必须说明 launch mode、focus policy、window placement、执行范围与证据目录。
 - 不把参考项目自身的测试通过视为 FluentRead 的验证结果。
 
 ## 개인 Firefox fork 운영
 
-- 이 fork의 개인 사용 대상은 Firefox입니다. 현재 작업은 Windows 빌드 오류 두 곳과 개인 패키징입니다. 번역 로직은 업스트림 그대로 유지합니다. 이 범위에서는 Chrome/userscript 빌드와 웹사이트 문서 빌드를 요구하지 않습니다.
+- 이 fork의 개인 사용 대상은 Firefox입니다. Windows 빌드 호환 패치와 개인 패키징을 유지합니다. 번역 성능은 Trancy와 같은 조건으로 비교하고, 측정으로 확인한 병목만 수정합니다. 기본 `viewport`와 기존 `all` 의미를 유지합니다. 공유 코드 변경은 Chrome/Firefox/userscript 빌드도 검사합니다. 웹사이트 문서 빌드는 웹사이트를 변경한 경우에만 요구합니다.
 - `origin`은 `euntaek-hong/FluentRead`, `upstream`은 `FluentRead/FluentRead`입니다. `main`은 업스트림을 따라가고 개인 수정은 `codex/firefox-local`에서 관리합니다. 업스트림 PR이나 정기 자동 업데이트는 만들지 않습니다.
 - 프로젝트 명령은 `npx --yes pnpm@9.12.1 <명령>`으로 실행할 수 있습니다. pnpm 전역 설치나 의존성 업그레이드는 필요하지 않습니다.
+- 브라우저와 GUI 자동화는 기존 실행기를 재사용해 별도 Win32 desktop object에서 실행합니다. 그 안에서 브라우저는 `headful`을 유지합니다. 숨기기 위해 `headless`로 변경하지 않습니다. 사용자 desktop으로 전환하지 않습니다. 사용자 화면과 작업 표시줄에 자동화 창이 나타나거나 깜빡이지 않게 합니다. 포커스를 가져오지 않습니다. CDP/Marionette로 페이지를 조작하며 전역 키보드 입력은 사용하지 않습니다.
 - Windows 확장 전용 설치에서 문서용 이미지 바이너리 설치가 실패하면 `install --frozen-lockfile --ignore-scripts`를 사용합니다. 이후 `node node_modules/esbuild/install.js`와 `exec wxt prepare`를 실행합니다. TLS 검사를 완화하지 않습니다.
 
 ### 업데이트 요청 시 체크리스트
 
 1. `git status --short`로 사용자 변경을 확인합니다. 작업 내용을 덮어쓰지 않고 `git fetch upstream`을 실행합니다.
-2. `scripts/firefox/maintenance.json`의 마지막 업스트림 커밋 이후 변경을 확인합니다. 검사 대상은 아래 두 동작입니다. 단순 문자열 검색으로 해결 여부를 판단하지 않습니다.
+2. `scripts/firefox/maintenance.json`의 마지막 업스트림 커밋 이후 변경을 확인합니다. 검사 대상은 아래 동작입니다. 단순 문자열 검색으로 해결 여부를 판단하지 않습니다.
    - `scripts/testing/run-resource-safe.mjs`: Windows에서 `shell:false`로 로컬 Node CLI를 실행해야 합니다. `wxt`, `vitest`, `vue-tsc`가 성공해야 하고 인수와 종료 코드가 보존되어야 합니다.
    - `wxt.config.ts`의 `build:publicAssets`: WXT가 `/` 또는 `\\` 구분자로 제공하는 OCR core/worker를 모두 찾아야 합니다. 실제 리소스가 없으면 오류를 유지해야 합니다.
-3. 업스트림에서 해결된 패치는 회귀 테스트로 확인한 후 개인 브랜치에서 제거합니다. 커밋 제목은 `fix: execute local Node CLIs directly on Windows`, `fix: normalize OCR public asset paths on Windows`입니다. 같은 방식으로 해결하지 않았어도 동작이 맞으면 로컬 패치를 유지할 이유가 없습니다.
+   - `userscript/vite.config.ts`: Windows 경로에서도 중국어 catalog 압축 대상과 TypeScript checker의 browser/chrome lexical binding을 정확하게 판별해야 합니다. personal correction 모듈의 격리 경계도 유지해야 합니다. `userscriptViteConfig.test.ts`와 userscript 빌드 verifier로 검사합니다. 이 호환 패치는 확장 빌드 공유 검증 과정에서 추가로 발견했습니다.
+3. 업스트림에서 해결된 패치는 회귀 테스트로 확인한 후 개인 브랜치에서 제거합니다. 기존 CLI와 OCR 패치 제목은 `fix: execute local Node CLIs directly on Windows`, `fix: normalize OCR public asset paths on Windows`입니다. userscript 패치 제목은 `fix: normalize userscript build module paths on Windows`입니다. 같은 방식으로 해결하지 않았어도 동작이 맞으면 로컬 패치를 유지할 이유가 없습니다.
 4. `main`을 업스트림 기본 브랜치로 fast-forward합니다. 개인 브랜치를 갱신된 `main` 위로 rebase합니다. 개인 fork origin에만 반영합니다. 충돌은 변경 의도와 회귀 테스트를 기준으로 해결합니다.
 5. `firefox:check`를 실행합니다. 업스트림 커밋과 남은 패치를 `scripts/firefox/maintenance.json`에 기록합니다. 개인 배포 버전을 `scripts/firefox/release.config.json`에서 증가시키고 소스 변경을 커밋합니다.
 6. `firefox:package`, `firefox:sign`을 순서대로 실행합니다. 산출물은 `.output/firefox-private/<개인 버전>/`에 저장됩니다. `release.json`에 원본 버전과 소스/upstream 커밋, 해시와 제출 상태가 기록됩니다.
+
+### 번역 성능 패치 점검
+
+- Google의 `translation-only` 경로는 실제 native provider와 기존 원문 복원 기능을 사용합니다. 서비스 이름만 보고 시작을 거부하거나 quick profile을 강제로 bilingual로 바꾸지 않습니다. 업스트림에서도 이 동작을 지원하면 개인 호환 패치를 제거합니다.
+- Google native HTTP는 escaped HTML 기준 32 text slots와 10,000자 경계를 따릅니다. 화면의 원문 입력을 하나의 문자열로 합치지 않습니다. 준비 작업은 최대 네 묶음인 128 slots와 40,000자로 제한합니다. AI의 4 slots와 2,000자 정책은 유지합니다. 실제 Google HTTP는 4개 동시 요청과 150ms 시작 간격을 사용합니다. 429의 전체 queue 중단과 단일 회복 probe를 유지합니다.
+- `viewport`의 요청 준비와 DOM lifecycle을 분리합니다. 기존 IO pending plan만 사용하며 준비 중인 요청과 아직 소비하지 않은 결과에 상한을 둡니다. 먼 영역에는 wrapper나 spinner를 만들지 않습니다. 후보가 prefetch 범위를 벗어나면 소비하지 않은 준비를 취소합니다. 공유 요청의 다른 소유자는 유지합니다.
+- 원문 변경과 SPA 전환을 기준으로 요청 유효성을 검사합니다. Google native 요청은 provider가 사용하지 않는 제목 때문에 중복 요청하지 않습니다. AI와 다른 서비스의 context identity는 유지합니다. 원문 복원은 기존 text node와 inline 구조를 보존해야 합니다.
+- `viewport`는 현재 화면의 고정 그룹을 결산한 뒤 유효한 결과를 한 DOM transaction으로 반영합니다. 개별 full-page spinner는 표시하지 않습니다. staging은 요청 준비 점유만 반환합니다. DOM에 반영하기 전에는 완료로 기록하거나 후보를 삭제하지 않습니다. 반복 IO가 staged 후보를 다시 dispatch하지 않아야 합니다. 취소한 그룹의 결과는 이후 DOM에 반영하지 않습니다.
+- 개인 ID의 업데이트에서 기존 공통 기본값 10개와 초당 10개를 한 번 20개와 초당 40개로 갱신합니다. 기존 `all` 설정은 이번 개선 대상인 `viewport`로 선택합니다. 사용자가 별도로 정한 요청 값과 서비스/모델 override는 유지합니다. 적용 marker를 기록하므로 이후 사용자 설정을 다시 변경하지 않습니다.
+- 업스트림 업데이트 시 아래 회귀 명령을 실행합니다. 구현 문자열보다 요청 묶음과 취소 동작을 기준으로 개인 패치의 필요성을 판단합니다.
+
+```bash
+npx --yes pnpm@9.12.1 test -- tests/fullPageVisibilityScheduling.test.ts tests/viewportCommitGroup.test.ts tests/fullPageTranslationIndicators.test.ts tests/liveTextTranslation.test.ts tests/google.test.ts tests/googleRequestGate.test.ts tests/translationRequestScheduler.test.ts tests/backgroundTranslationHandler.test.ts tests/viewportStability.test.ts tests/personalPerformancePreset.test.ts tests/personalPerformanceRuntime.test.ts tests/translationConfigCheck.test.ts tests/quickTranslation.test.ts tests/quickProfileSettingsLifecycle.test.ts
+npx --yes pnpm@9.12.1 test:audit
+npx --yes pnpm@9.12.1 compile
+```
+
+- 성능 비교는 같은 fixture, viewport, 표시 방식과 응답 지연을 사용합니다. 번역용 host 생성은 완료가 아닙니다. 처음 화면에 보인 원문별로 실제 응답이 DOM에 반영됐는지 검사합니다. cold trial은 새 background/cache를 사용합니다. warm trial은 같은 background worker에서 같은 원문을 다시 번역합니다.
+- 원본 trace와 실행 환경은 `C:/Users/ifiha/zelley/free/research/translation-performance`에 보관합니다. coverage를 켠 실행의 시간은 속도 비교에 사용하지 않습니다. 측정 중에는 빌드나 테스트를 동시에 실행하지 않습니다.
+- 일반 기사에서 baseline, 화면 일괄 전환, 요청 예산 증가, 둘의 조합을 구분해 비교합니다. 일부 문단이 먼저 보이는 프레임이 없는지 검사합니다. 캐시 없는 경우와 캐시 있는 경우를 나눠 기록합니다. 100만 자라는 문서 길이는 목표나 배포 기준으로 사용하지 않습니다.
+- 업스트림에서는 구현 형태보다 동작으로 패치 필요성을 확인합니다. cap1/group3 완료와 staged 취소를 확인합니다. 스크롤 이탈 후 재진입, 원문 변경, SPA 전환도 확인합니다. 반복 IO admission이 이미 도착한 결과를 버리면 안 됩니다. 한 요청이 실패해도 성공한 문단은 반영하고 실패한 문단의 재시도 상태는 유지해야 합니다.
+- 공유 코드 변경을 배포하기 전에 Chrome, Firefox, userscript를 빌드합니다. `verify:extension-manifests`와 `scripts/verify-userscript-build.mjs`도 실행합니다. Firefox 개인 버전만 올리며 원본 package 버전과 lockfile은 유지합니다.
 
 ### 개인 서명과 설치
 

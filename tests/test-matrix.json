@@ -431,7 +431,9 @@
       "tests/personalCorrectionMemory.test.ts",
       "tests/readingEvidence.test.ts",
       "tests/videoSentenceTimeline.test.ts",
-      "tests/vocabularyVideoSource.test.ts"
+      "tests/vocabularyVideoSource.test.ts",
+      "tests/personalPerformancePreset.test.ts",
+      "tests/personalPerformanceRuntime.test.ts"
     ],
     "functional": [
       "tests/learningCenterLifecycle.test.ts",
@@ -674,6 +676,7 @@
       "tests/fullPageTitleTranslation.test.ts",
       "tests/featureVerticalSliceRegression.test.ts",
       "tests/fullPageVisibilityScheduling.test.ts",
+      "tests/viewportCommitGroup.test.ts",
       "tests/fullPageTranslationConfigSnapshot.test.ts",
       "tests/fullPageHostClassPreservation.test.ts",
       "tests/pageTranslationAdvanced.test.ts",

@@ -64,6 +64,15 @@ describe('延迟全文 loading', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it('视口 묶음이 결과를 기다리는 동안에는 개별 loading을 만들지 않는다', () => {
+    const {node, state} = start();
+    scheduleTranslationLoadingIndicator(node, state, true, true)();
+    vi.advanceTimersByTime(500);
+    expect(node.querySelector('.fluent-read-loading')).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+    restoreTranslation(node);
+  });
+
   it.each(['abort', 'detached', 'replaced', 'settled'] as const)('迟到回调不影响 %s 的 generation', reason => {
     const {node, state, generation} = start();
     scheduleTranslationLoadingIndicator(node, state, true);

@@ -74,7 +74,7 @@ export async function sanitizeSources(bytes, buildInfo) {
     zip.file('FIREFOX-PERSONAL-BUILD.json', JSON.stringify(buildInfo, null, 2) + '\n');
     zip.file('FIREFOX-PERSONAL-BUILD.md', [
         '# FluentRead Personal Firefox reproduction', '',
-        'Node 24.14.0, pnpm 9.12.1, locked WXT 0.20.18.',
+        'Node 24.21.0, pnpm 9.12.1, locked WXT 0.20.18.',
         'Private identity is applied to a staging copy; the upstream manifest stays intact.',
         'Windows extension-only setup (documentation image tools are not needed):',
         '```', 'npx --yes pnpm@9.12.1 install --frozen-lockfile --ignore-scripts',

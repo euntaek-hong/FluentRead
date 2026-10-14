@@ -4,226 +4,69 @@
  * 主要内容：精确相同译文和有同目标语言证据的排版回显保留原文且不重复展示；以增量计数发布完成与失败摘要，仅对本会话失败目标重试和定位；维护 FullPageSession、AbortController、Intersection/Mutation 观察器、弹窗优先调度、精确属性写入过滤、候选所有权和生命周期重试；对变化来源等待安静窗口、跳过持续变化的计数，并清理延迟重扫，只有真实宿主删除启动候选回收，同批重复属性变化只处理一次；按时间片派发并在全文结果提交前让出主线程，合并同段 DOM 写入并在重挂时复用同批布局读数与单文本来源快照；Google viewport 仅从既有 IO pending 计划预准备有界请求，不创建 wrapper、spinner 或翻译状态；合成行内段在延迟 loading 前后都按精确来源节点、HTML 和 Text 槽识别自身迁移；已拥有状态的发现候选直接登记复验，取消记录命中后才提取原文，避免整批重扫重复计算熔断签名；连续滚动时限频派发当前可见候选，空闲后恢复预取，按阅读进度撤回离开预取区的待派发候选，冻结请求/展示配置与识别范围，在弹窗关闭后继续正文，按实际节点阶段发布进度及工具栏结果；悬浮按候选停留而非每次移动计时，同段复用冻结的独立服务与快捷方案配置，到期复验最新命中并在路由切换取消；同目标预检单独读取受保护规则约束的行内代码语言上下文，发送与渲染仍只使用可翻译文本槽；恢复单个所有者或全文时重置篇章证据，统一恢复原文并清理重挂预算及孤儿产物；向局部翻译开放单候选 translateTarget 与单个译文所有者的恢复入口。
  * 模块边界：这是 content 侧编排层，不实现 provider 协议、纯候选算法或底层状态存储；翻译调用经 app client，发现规则来自 core/translation，渲染与状态分别交给 renderer、liveTextRender 和 state。
  */
+import {createFullPageMutationRuntime} from './mutationRuntime';
+import type {FullPageSession, TranslationTargetOutcome, ViewportCommitPlan, ViewportCommitEntry, ViewportCommitTicket, PreparedCandidate} from './sessionTypes';
 import {resetPageDiscourseContext} from '@/src/services/translation/context/pageDiscourse';
 import {resolveTranslationToolbarStatus, countFullPageTranslationWork} from '../toolbarStatus';
 import {hasDistinctTargetTranslation as hasDistinctTranslation} from '@/src/core/translation/targetResult';
 import {getFullPageTranslationStateRevision, notifyFullPageTranslationState, notifyTranslationToolbarStatus} from './stateNotification';
 import type {FrameTranslationState} from './frameSession';
-import { checkConfig } from "@/src/app/translation/check";
+import {checkConfig} from "@/src/app/translation/check";
 import {insertFailedTip} from '@/src/features/full-page-translation/ui/translationIndicators';
 import {scheduleTranslationLoadingIndicator} from './loadingIndicator';
 import {syncModalTranslationHint} from '../ui/modalProgressHint';
-import { styles } from "@/src/core/config/constants";
-import {
-    extractTranslationText,
-    extractTranslationTextFromNodes,
-    applyTranslationsToSnapshot,
-    collectLiveTranslationTextSlots,
-    createTranslationSourceSnapshot,
-    getComposedParent,
-    getCurrentTranslationCore,
-    getOpenShadowRoots,
-    getTranslationCandidateKey,
-    resolveTranslationCandidateAtPoint,
-    selectPreferredTranslationCandidate,
-} from "@/src/core/translation/public";
-import type {
-    TranslationCandidate,
-    TranslationScope,
-    TranslationDiscoveryStep,
-} from "@/src/core/translation/public";
+import {styles} from "@/src/core/config/constants";
+import {extractTranslationText, extractTranslationTextFromNodes, applyTranslationsToSnapshot, collectLiveTranslationTextSlots, createTranslationSourceSnapshot, getComposedParent, getCurrentTranslationCore, getOpenShadowRoots, getTranslationCandidateKey, resolveTranslationCandidateAtPoint, selectPreferredTranslationCandidate} from "@/src/core/translation/public";
+import type {TranslationCandidate, TranslationScope} from "@/src/core/translation/public";
 import {shouldSkipTranslationForTarget} from '@/src/core/language/detect';
 import {services} from '@/src/core/config/catalog';
-import { config } from "@/src/services/config/store";
-import type { FullPageTranslationMode } from "@/src/core/config/model";
-import { consumeEagerTranslationBudget } from "@/src/features/full-page-translation/content/eagerTranslation";
+import {config} from "@/src/services/config/store";
+import type {FullPageTranslationMode} from "@/src/core/config/model";
+import {consumeEagerTranslationBudget} from "@/src/features/full-page-translation/content/eagerTranslation";
 import {normalizeMaxConcurrentTranslations} from "@/src/core/config/scheduling";
 import {cancelTranslationQueueSession, createTranslationQueueSession} from "@/src/services/translation/queue";
-import {
-    finishFullPageTranslationProgress,
-    startFullPageTranslationProgress,
-    updateFullPageTranslationProgress,
-} from '@/src/features/full-page-translation/progress';
+import {finishFullPageTranslationProgress, startFullPageTranslationProgress, updateFullPageTranslationProgress} from '@/src/features/full-page-translation/progress';
 import {createFullPageOutcomeRegistry} from '../core/outcomes';
 import {bindFullPageOutcomeRecovery, getFullPageOutcomeSummary, getFullPageModalOutcomePhases, registerFullPageOutcomeTarget} from './outcomeSession';
-import {
-    appendBilingualTranslation,
-    materializeCandidate,
-    materializeVisualTranslationCandidate,
-} from "@/src/features/full-page-translation/content/renderer";
+import {appendBilingualTranslation, materializeCandidate, materializeVisualTranslationCandidate} from "@/src/features/full-page-translation/content/renderer";
 import {renderLiveTextResult} from "@/src/features/full-page-translation/content/liveTextRender";
 import {ensureTranslationTruncationLayout} from "@/src/features/full-page-translation/content/layout";
-import {blocksBilingualRemountCandidate, createBilingualRemountCapitulationRegistry,
-    createRemovedTranslationOwnerResolver, createBilingualRemountPreparationBatch, forgetBilingualRemountCandidate, stabilizeBilingualArtifact,
-    transferEquivalentBilingualOwners as adoptEquivalentBilingualOwners, type RemovedTranslationOwnerResolver}
-    from '@/src/features/full-page-translation/content/bilingualRemount';
+import {blocksBilingualRemountCandidate, createBilingualRemountCapitulationRegistry, createRemovedTranslationOwnerResolver, createBilingualRemountPreparationBatch, forgetBilingualRemountCandidate, stabilizeBilingualArtifact, transferEquivalentBilingualOwners as adoptEquivalentBilingualOwners, type RemovedTranslationOwnerResolver} from '@/src/features/full-page-translation/content/bilingualRemount';
 import {refreshBilingualTranslationSkeleton} from '@/src/features/full-page-translation/content/bilingualReplay';
 import {isAnchorNearViewport, TranslationSourceStabilityGate} from './sourceStabilityGate';
-import {transferEquivalentSyntheticBilingualSegments} from
-    '@/src/features/full-page-translation/content/syntheticRemount';
-import {
-    beginBilingualArtifactHostWriteGesture, beginTranslation,
-    detachFailedTranslationUi,
-    discardTranslation,
-    getOwnedTranslationCandidateAtPoint, getTranslationState,
-    resolveTranslationStateNode,
-    getTranslationOwnersForRemovedNode,
-    markTranslationComplete,
-    markTranslationError,
-    resetAllBilingualArtifactHostWriteBudgets,
-    resetBilingualArtifactHostWriteBudget,
-    restoreTranslation,
-    createBilingualTranslationReplay,
-    setBilingualContent,
-    setBilingualArtifactCapitulationHandler,
-    setBilingualLifecycleExternalManager,
-    setBilingualOwnerRemountHandler,
-    setBilingualSkeletonRefreshHandler,
-    setRenderedStyleAttribute,
-    setRetryWrapper,
-    isTranslationLayoutOverrideMutation,
-    type TranslationState,
-} from "@/src/features/full-page-translation/content/state";
-import {
-    captureFullPageTranslationConfig,
-    getTranslationInvocationIdentity,
-    type FullPageTranslationCacheEntry,
-    type FullPageTranslationConfigSnapshot, type FullPageTranslationSessionCache,
-    type PageTranslationConfigOverrides,
-} from '@/src/features/full-page-translation/content/translationRequest';
-import {
-    startFullPageTitleTranslation,
-    stopFullPageTitleTranslation,
-} from '@/src/features/full-page-translation/content/titleTranslation';
-import {
-    createFullPageScrollController,
-    withFullPageViewportAnchor,
-    type FullPageScrollController,
-} from '@/src/features/full-page-translation/content/viewportStability';
-import {clearFullPageQueueState, createFullPageQueueState, noteFullPageScroll, queueFullPageCandidate, queueFullPageFailedCandidate, removeFullPagePending, createFullPageDispatchPlan, type FullPageQueueState, type FullPageDispatchPlan} from '@/src/features/full-page-translation/content/fullPageQueue';
+import {transferEquivalentSyntheticBilingualSegments} from '@/src/features/full-page-translation/content/syntheticRemount';
+import {beginBilingualArtifactHostWriteGesture, beginTranslation, discardTranslation, getOwnedTranslationCandidateAtPoint, getTranslationState, resolveTranslationStateNode, markTranslationComplete, markTranslationError, resetAllBilingualArtifactHostWriteBudgets, resetBilingualArtifactHostWriteBudget, restoreTranslation, createBilingualTranslationReplay, setBilingualContent, setBilingualArtifactCapitulationHandler, setBilingualLifecycleExternalManager, setBilingualOwnerRemountHandler, setBilingualSkeletonRefreshHandler, setRenderedStyleAttribute, setRetryWrapper, type TranslationState} from "@/src/features/full-page-translation/content/state";
+import {canPrimeNativeGoogleSlots, captureFullPageTranslationConfig, primeNativeGooglePageSlots, getTranslationInvocationIdentity, type FullPageTranslationConfigSnapshot, type FullPageTranslationSessionCache, type PageTranslationConfigOverrides} from '@/src/features/full-page-translation/content/translationRequest';
+import {startFullPageTitleTranslation, stopFullPageTitleTranslation} from '@/src/features/full-page-translation/content/titleTranslation';
+import {createFullPageScrollController, withFullPageViewportAnchor} from '@/src/features/full-page-translation/content/viewportStability';
+import {clearFullPageQueueState, createFullPageQueueState, noteFullPageScroll, queueFullPageCandidate, queueFullPageFailedCandidate, removeFullPagePending, createFullPageDispatchPlan, type FullPageDispatchPlan} from '@/src/features/full-page-translation/content/fullPageQueue';
 import {FULL_PAGE_PREFETCH_MARGIN_PX} from '@/src/features/full-page-translation/content/fullPagePriority';
-import {
-    createLifecycleRetry, sameLifecycleRetry, createAcceptedUnchangedCompletion, readAcceptedUnchangedCompletion,
-    type FullPageLifecycleRetry, type AcceptedUnchangedCompletion, canKeepTranslationAttempt,
-    getCandidateTranslationTextProtectionOptions,
-    isTranslationCandidateCurrent as candidateIsCurrent,
-    isTranslationStateCandidateCurrent, createTranslationMutationStabilityChecks,
-    isTranslationStateSourceCurrent as attemptSourceIsCurrent,
-    TRANSLATION_ARTIFACT_SELECTOR,
-    getCurrentTranslationStateTextNodes,
-    getTranslationStateProtectionBoundary,
-    getTranslationTextProtectionOptions,
-    hasCurrentTranslationSource,
-    isOwnCurrentArtifactAddition, isOwnStateArtifactMutation,
-    isOwnSingleTextSlotMove,
-    isTranslationArtifactCurrent,
-    isTranslationArtifact,
-    mutationTouchesCurrentTranslationArtifact,
-    normalizeComparableText,
-    statefulSourceAndTextSlotsAreCurrent,
-} from '@/src/features/full-page-translation/content/translationStability';
-import {
-    createTranslationRequest,
-    type TranslationResult,
-} from '@/src/features/full-page-translation/content/liveTextTranslation';
-import {restorePageTranslationContent, consumeOrphanedOwnerClassMutation, isTextEquivalentHostReplacement, normalizeOrphanedSingleSlots, normalizeOrphanedTranslationArtifacts, normalizeOrphanedTranslationOwner}
-    from '@/src/features/full-page-translation/content/orphanArtifacts';
-import {bindFullPageRequestSessionAttempt, createFullPageRequestSessionState, disposeFullPageRequestSession, getHoverTranslationRequestSession, invalidateContextSensitiveRequestCache, invalidateFullPageRequestSessionCache, invalidateHoverTranslationRequestSession, resetHoverTranslationRequestSession, type FullPageRequestSessionState} from '@/src/features/full-page-translation/content/requestSession';
+import {createLifecycleRetry, sameLifecycleRetry, createAcceptedUnchangedCompletion, readAcceptedUnchangedCompletion, getCandidateTranslationTextProtectionOptions, isTranslationCandidateCurrent as candidateIsCurrent, isTranslationStateSourceCurrent as attemptSourceIsCurrent, TRANSLATION_ARTIFACT_SELECTOR, getCurrentTranslationStateTextNodes, getTranslationStateProtectionBoundary, getTranslationTextProtectionOptions, normalizeComparableText} from '@/src/features/full-page-translation/content/translationStability';
+import {createTranslationRequest, type TranslationResult} from '@/src/features/full-page-translation/content/liveTextTranslation';
+import {restorePageTranslationContent, normalizeOrphanedSingleSlots, normalizeOrphanedTranslationArtifacts, normalizeOrphanedTranslationOwner} from '@/src/features/full-page-translation/content/orphanArtifacts';
+import {bindFullPageRequestSessionAttempt, createFullPageRequestSessionState, disposeFullPageRequestSession, getHoverTranslationRequestSession, invalidateContextSensitiveRequestCache, invalidateFullPageRequestSessionCache, invalidateHoverTranslationRequestSession, resetHoverTranslationRequestSession} from '@/src/features/full-page-translation/content/requestSession';
 import {resetFullPageRouteSession} from './routeLifecycle';
 import {HoverTranslationScheduler, type HoverTranslationInvocation} from './hoverScheduler';
 import {personalCorrectionIsCurrent, registerPersonalCorrectionResult} from './personalCorrections';
-import {getSiteAdapterAttributeFilter} from '@/src/core/site-adaptation/compiler';
-import {isElementNode, asHTMLElement, mutationTargetElement, allMutationNodesMatch, createTranslationAttributeMutationFilter, createTranslationMutationObserverOptions, isOwnSyntheticSegmentMarkerMutation, mutationRootContains as nodeContains, collapseMutationRescanRoot as broadRescanRoot} from './mutationObservation';
-import {isWithinTranslationModal, mayChangeTranslationModal} from './modalPriority';
-import {refreshModalSession, type ModalPrioritySession} from './modalSession';
-import {createAttributeMutationBatch} from './attributeMutationBatch';
+
+import {isElementNode, asHTMLElement, createTranslationMutationObserverOptions, mutationRootContains as nodeContains, collapseMutationRescanRoot as broadRescanRoot} from './mutationObservation';
+import {isWithinTranslationModal} from './modalPriority';
+import {refreshModalSession} from './modalSession';
+
+import {createViewportCommitGroup, type ViewportCommitGroup} from './viewportCommitGroup';
+import {isViewportCommitGroupEnabled} from './viewportCommitExperiment';
+
 const translationSourceStability = new TranslationSourceStabilityGate<FullPageSession>({
     isCurrent: session => session.active && fullPageSession === session,
     resolve: resolveFullPageRetryCandidate, discover: scheduleDiscoveredCandidate, source: candidateLifecycleSource,
     queue: queueFullPageCandidate, drain: scheduleFullPageDrain,
 });
-export type TranslationTargetOutcome =
-    | {status: "committed" | "failed" | "owned"}
-    | {status: "unchanged"; source: string; attemptNode?: HTMLElement; completion?: AcceptedUnchangedCompletion}
-    | {
-        status: "stale" | "not-current" | "empty";
-        retryRoot?: Node;
-        /** 尝试 owner，用于在较新的 generation 接管后拒绝旧重试。 */
-        attemptNode?: HTMLElement;
-    };
-interface FullPageSession extends FullPageRequestSessionState, ModalPrioritySession, FullPageQueueState {
-    translationMode: FullPageTranslationMode;
-    scope: TranslationScope;
-    /** 会话启动时冻结所有会改变译文或 DOM 表达的配置，防止设置热更新混入当前页面。 */
-    translationConfig: FullPageTranslationConfigSnapshot;
-    progressSessionId: number;
-    progressPublishScheduled: boolean;
-    outcomes: ReturnType<typeof createFullPageOutcomeRegistry<HTMLElement>>;
-    unsubscribeOutcomeChanges: () => void;
-    observer: IntersectionObserver;
-    mutationObserver: MutationObserver;
-    shadowEventController: AbortController;
-    /** 可见性锚点 -> 等待该锚点进入视口的候选。 */
-    observedCandidates: Map<HTMLElement, Map<Node, TranslationCandidate>>;
-    /** 最近一次 IO 通知为可见的锚点；同锚点迟到的候选需立即入队。 */
-    visibleCandidateAnchors: WeakSet<HTMLElement>;
-    /** 候选元素 -> 候选 key；与可见性锚点分开保存，便于精确清理。 */
-    candidateOwnerKeys: Map<HTMLElement, Set<Node>>;
-    /** 宿主 owner/祖先 -> 其下活跃翻译目标，避免 mutation 时全局扫描状态。 */
-    statefulTargetsByAncestor: Map<Element, Set<HTMLElement>>;
-    /** 活跃目标 -> 上述索引中为它登记的精确祖先 key。 */
-    statefulAncestorsByTarget: WeakMap<HTMLElement, readonly Element[]>;
-    /** provider 请求在途时失效候选的有界即时重试记录。 */
-    lifecycleRetries: WeakMap<Node, FullPageLifecycleRetry>;
-    /** 限定在本次全文会话内的 provider/语言“无需变更”判定。 */
-    unchangedCandidates: WeakMap<Node, FullPageLifecycleRetry>;
-    /**
-     * 用户在本次全文会话中显式恢复的候选标识。来源快照允许真实宿主编辑
-     * 清除取消墓碑，同时让扩展自身产生的恢复 mutation 继续排除该片段。
-     * 按节点弱关联，不因保留取消记录而延长已被宿主删除节点的生命周期。
-     */
-    userCancelledCandidates: WeakMap<Node, string>;
-    /** 用户滚动期间暂停新增翻译/重排，等待虚拟列表稳定后再继续。 */
-    scrollController: FullPageScrollController;
-    /** 宿主连续拒绝 wrapper 后，对稳定边界内的同源候选停止写 DOM。 */
-    bilingualRemountCapitulations: ReturnType<typeof createBilingualRemountCapitulationRegistry>;
-    /**
-     * 本次全文会话已经请求过的翻译结果。宿主框架可能在样式/布局 mutation 后
-     * 重新挂载同一段正文；此缓存避免生命周期抖动再次发出相同 provider 请求。
-     */
-    translationSlotCache: Map<string, FullPageTranslationCacheEntry>;
-    /** 尚未交给 DOM 生命周期消费的 Google viewport 请求预准备。 */
-    preparedCandidates: Map<Node, PreparedCandidate>;
-    preparedSlots: number;
-    preparedEscapedCharacters: number;
-    draining: boolean;
-    flushTimer: number | null;
-    dirtyRoots: Set<Node>;
-    mutationFlushTimer: number | null;
-    activeDiscovery: {root: Node; steps: Generator<TranslationDiscoveryStep>} | null;
-    broadRescanRoots: WeakSet<Node>;
-    dirtyRootsBroadMode: boolean;
-    pruneTimer: number | null;
-    pruneIterator: Iterator<TranslationCandidate> | null;
-    pruneRequested: boolean;
-    statefulAttributeTimers: Map<HTMLElement, {timer: number; boundaryTimer?: number}>;
-    statefulAttributeRescanTargets: WeakSet<HTMLElement>;
-}
-interface PreparedCandidate {
-    candidate: TranslationCandidate;
-    controller: AbortController;
-    source: string;
-    slots: number;
-    escapedCharacters: number;
-    settled: boolean;
-    consumed: boolean;
-}
+export type {TranslationTargetOutcome} from './sessionTypes';
 const BROAD_RESCAN_COOLDOWN_MS = 1_000;
-const CANDIDATE_PRUNE_BUDGET_MS = 4;
-const STATEFUL_ATTRIBUTE_DEBOUNCE_MS = 500;
 const FULL_PAGE_LIFECYCLE_RETRY_LIMIT = 2;
-const FULL_PAGE_PREPARE_MAX_TEXT_SLOTS = 32;
-const FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS = 10_000;
+// 同时准备至多四个独立 native 批次，provider 仍按 32 槽/10k 分包。
+const FULL_PAGE_PREPARE_MAX_TEXT_SLOTS = 128;
+const FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS = 40_000;
 const GOOGLE_HTML_WRAPPER_CHARACTERS = 11;
 
 const hoverTranslationScheduler = new HoverTranslationScheduler({
@@ -239,6 +82,9 @@ const hoverTranslationScheduler = new HoverTranslationScheduler({
     translate: (candidate, snapshot, continuous) => { void translateTarget(candidate, snapshot.displayMode, continuous, undefined, snapshot); },
 });
 let fullPageSession: FullPageSession | null = null;
+const {removeScheduledForStateTarget, restartStatefulTarget, scheduleStatefulAttributeReevaluation, createFullPageMutationObserver} = createFullPageMutationRuntime({
+    forgetCandidate, refreshCandidateVisibilityBinding, unregisterSessionStatefulTarget, registerSessionStatefulTarget, enqueueFullPageRescan, transferEquivalentBilingualOwners, refreshFullPageModal, getCurrentSession: () => fullPageSession,
+});
 let hoverBilingualRemountCapitulations = createBilingualRemountCapitulationRegistry();
 setBilingualLifecycleExternalManager(() => fullPageSession?.active === true);
 setBilingualOwnerRemountHandler((mutations) => transferEquivalentBilingualOwners(undefined, mutations));
@@ -432,6 +278,7 @@ async function renderTranslation(
     snapshot: FullPageTranslationConfigSnapshot,
     requestSession: FullPageTranslationSessionCache, requestCommitGeneration: number,
     owner?: FullPageSession,
+    viewportCommitTicket?: ViewportCommitTicket,
 ): Promise<TranslationTargetOutcome> {
     const { state, generation } = attempt;
 
@@ -443,6 +290,12 @@ async function renderTranslation(
 
     try {
         const result = await request;
+        if (viewportCommitTicket) {
+            const staged = await prepareViewportCommit(
+                node, candidate, attempt, result, snapshot, requestSession, requestCommitGeneration, owner,
+            );
+            return await viewportCommitTicket.stage(node, staged);
+        }
         // 缓存命中/批量响应会在同一个微任务检查点完成很多段。给每个全文提交独立的
         // 浏览器任务，让输入与绘制能够穿插；让出后仍须复验取消、generation 和宿主节点。
         if (owner) await new Promise<void>(resolve => window.setTimeout(resolve, 0));
@@ -527,6 +380,105 @@ async function renderTranslation(
     }
 }
 
+async function prepareViewportCommit(
+    node: HTMLElement,
+    candidate: TranslationCandidate,
+    attempt: NonNullable<ReturnType<typeof beginTranslation>>,
+    result: TranslationResult,
+    snapshot: FullPageTranslationConfigSnapshot,
+    requestSession: FullPageTranslationSessionCache,
+    requestCommitGeneration: number,
+    owner?: FullPageSession,
+): Promise<ViewportCommitPlan> {
+    const {state, generation} = attempt;
+    const stableOwner = owner;
+    const stale = (): TranslationTargetOutcome => ({status: 'stale', retryRoot: discardStaleAttempt(node, state), attemptNode: node});
+    const cancel = (): void => { if (getTranslationState(node) === state) discardStaleAttempt(node, state); };
+    const isBaseCurrent = (): boolean => state.controller.signal.aborted === false &&
+        getTranslationState(node) === state && stableOwner?.active === true && fullPageSession === stableOwner &&
+        (requestSession.renderCommitGeneration ?? 0) === requestCommitGeneration && node.isConnected &&
+        attemptSourceIsCurrent(node, state) && (Boolean(candidate.nodes?.length) || candidateIsCurrent(candidate));
+    if (import.meta.env.BROWSER !== 'userscript' && !await personalCorrectionIsCurrent(result.personalCorrection, node)) {
+        return {isCurrent: () => false, commit: stale, cancel};
+    }
+    if (!isBaseCurrent()) return {isCurrent: () => false, commit: stale, cancel};
+    if (result.kind === 'control-value' || result.kind === 'live-text') {
+        return {
+            isCurrent: isBaseCurrent,
+            commit: () => {
+                if (!isBaseCurrent()) return stale();
+                const committed = renderLiveTextResult(node, state, generation, result, candidate.scope, snapshot.targetLanguage);
+                if (committed === 'committed') return {status: 'committed'};
+                if (committed === 'unchanged') return {status: 'unchanged', source: state.sourceText, attemptNode: node};
+                return committed === 'stale' ? stale() : {status: 'empty', retryRoot: node.isConnected ? node : undefined, attemptNode: node};
+            },
+            cancel,
+        };
+    }
+    if (result.sources.length === 0 || result.translations.length !== result.sources.length) {
+        return {
+            isCurrent: isBaseCurrent,
+            commit: () => {
+                if (!isBaseCurrent()) return stale();
+                discardTranslation(node, state);
+                return {status: 'empty', retryRoot: node.isConnected ? node : undefined, attemptNode: node};
+            },
+            cancel,
+        };
+    }
+    if (!result.translations.some((translation, index) => hasDistinctTranslation(result.sources[index] ?? '', translation, snapshot.targetLanguage))) {
+        const completion = stableOwner?.scheduled.get(getTranslationCandidateKey(candidate)) === candidate
+            ? createAcceptedUnchangedCompletion(node, candidate, state, generation, result.sources, result.translations,
+                {...snapshot, sessionId: stableOwner!.progressSessionId, renderCommitGeneration: requestCommitGeneration,
+                    configIdentity: getTranslationInvocationIdentity(snapshot)}) : undefined;
+        return {
+            isCurrent: isBaseCurrent,
+            commit: () => {
+                if (!isBaseCurrent()) return stale();
+                const discarded = discardTranslation(node, state);
+                return {status: 'unchanged', source: state.sourceText, attemptNode: node, completion: discarded ? completion : undefined};
+            },
+            cancel,
+        };
+    }
+    const core = getCurrentTranslationCore(candidate.scope);
+    const freshSnapshot = createTranslationSourceSnapshot(node, core.shouldStayOriginal,
+        getTranslationStateProtectionBoundary(node, state),
+        getTranslationTextProtectionOptions(state.allowTopLevelApplicationShell, node), core.shouldOmitFromTranslation);
+    const freshSources = freshSnapshot.slots.map(slot => slot.source);
+    const areSourcesCurrent = (): boolean => {
+        if (!isBaseCurrent()) return false;
+        const current = createTranslationSourceSnapshot(node, core.shouldStayOriginal,
+            getTranslationStateProtectionBoundary(node, state),
+            getTranslationTextProtectionOptions(state.allowTopLevelApplicationShell, node), core.shouldOmitFromTranslation);
+        const currentSources = current.slots.map(slot => slot.source);
+        return currentSources.length === result.sources.length &&
+            currentSources.every((source, index) => source === result.sources[index]);
+    };
+    if (freshSources.length !== result.sources.length || freshSources.some((source, index) => source !== result.sources[index])) {
+        return {isCurrent: () => false, commit: stale, cancel};
+    }
+    const translatedText = applyTranslationsToSnapshot(freshSnapshot, result.translations);
+    return {
+        isCurrent: areSourcesCurrent,
+        commit: () => {
+            if (!areSourcesCurrent() || !markTranslationComplete(node, state, generation, false)) return stale();
+            state.sourceTextNodes = getCurrentTranslationStateTextNodes(node, state);
+            state.spinner?.remove();
+            state.sourceHTML = node.innerHTML;
+            const content = appendBilingualTranslation(node, translatedText, {
+                sourceSkeleton: freshSnapshot.clone, targetLanguage: snapshot.targetLanguage, style: snapshot.style,
+                sourceText: result.sources.join('\n'), longParagraphLineBreak: snapshot.longParagraphLineBreak,
+                translationBeforeOriginal: snapshot.translationBeforeOriginal,
+            });
+            setBilingualContent(node, content, createBilingualTranslationReplay(result.sources, result.translations, snapshot));
+            setRenderedStyleAttribute(node);
+            if (import.meta.env.BROWSER !== 'userscript') registerPersonalCorrectionResult(node, state, result.personalCorrection);
+            return {status: 'committed'};
+        },
+        cancel,
+    };
+}
 function hasIntersectionLayoutBox(element: HTMLElement): boolean {
     if (typeof element.getClientRects !== "function") return false;
     try {
@@ -714,6 +666,19 @@ function refreshCandidateVisibilityBinding(
         return;
     }
 
+    if (shouldPrepareGoogleViewport(session)) {
+        if (isAnchorVisible(nextAnchor)) session.googleInitialWaveSawVisible = true;
+        else if (session.googleInitialWaveSawVisible && isAnchorBelowViewport(nextAnchor)) {
+            releaseInitialGoogleVisibleWave(session);
+        }
+    }
+    if (isViewportCommitGroupEnabled() && session.translationMode === 'viewport') {
+        if (isAnchorVisible(nextAnchor)) session.viewportCommitInitialSawVisible = true;
+        else if (session.viewportCommitInitialSawVisible && isAnchorBelowViewport(nextAnchor)) {
+            releaseInitialViewportCommitGroup(session);
+        }
+    }
+
     let observed = session.observedCandidates.get(nextAnchor);
     const alreadyObserved = Boolean(observed);
     if (!observed) {
@@ -726,6 +691,7 @@ function refreshCandidateVisibilityBinding(
     // observe() 对已观察且仍可见的元素不会再次派发入视口事件。增量发现
     // 可能在首个同容器候选完成后才登记其余歌词行，此时直接唤醒新候选。
     if (session.visibleCandidateAnchors.has(nextAnchor) &&
+        (!isViewportCommitGroupEnabled() || session.translationMode !== 'viewport' || session.viewportCommitDiscoveryReady) &&
         (alreadyObserved || isAnchorNearViewport(nextAnchor))) {
         queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
         scheduleFullPageDrain(session);
@@ -753,6 +719,7 @@ function cancelPreparedCandidate(session: FullPageSession, candidate: Translatio
     if (!entry) return;
     releasePreparedCandidate(session, key, entry);
     entry.controller.abort();
+    abortGooglePrimeWithoutMembers(session);
 }
 
 /** 未交给 DOM 消费的预准备归属旧路线时必须同步释放；旧 completion 不能释放同 key 的新条目。 */
@@ -761,8 +728,21 @@ function clearPreparedCandidates(session: FullPageSession): void {
         releasePreparedCandidate(session, key, entry);
         entry.controller.abort();
     }
+    abortGooglePrimeWithoutMembers(session);
     session.preparedSlots = 0;
     session.preparedEscapedCharacters = 0;
+}
+
+/**
+ * Google prime은 아직 DOM lifecycle에 넘기지 않은 후보 controller를 lease로 쓴다.
+ * 한 후보가 viewport를 벗어나도 같은 wave의 다른 후보는 계속 기다린다. 모두 사라질
+ * 때만 wave controller를 중단해 queue lease와 provider 작업을 즉시 돌려준다.
+ */
+function abortGooglePrimeWithoutMembers(session: FullPageSession): void {
+    const controller = session.primedGoogleWaveController;
+    const members = session.primedGoogleWaveMembers;
+    if (!controller || !members || members.some(entry => !entry.controller.signal.aborted)) return;
+    controller.abort();
 }
 
 function canPrepareGoogleCandidate(session: FullPageSession, candidate: TranslationCandidate): boolean {
@@ -793,10 +773,6 @@ function prepareGoogleCandidate(session: FullPageSession, candidate: Translation
     const protectionOptions = getCandidateTranslationTextProtectionOptions(candidate);
     const source = candidateSourceText(candidate, core, protectionOptions);
     const existing = session.preparedCandidates.get(key);
-    if (existing) {
-        if (existing.source === source) return;
-        cancelPreparedCandidate(session, existing.candidate);
-    }
     if (!normalizeComparableText(source)) return;
     // translateTarget와 같은 자동 진입 문턱을 DOM 생성 전에 적용한다. 안정화 gate는
     // 대기 timer를 등록할 수 있지만 provider, spinner, wrapper 또는 상태를 만들지 않는다.
@@ -817,6 +793,17 @@ function prepareGoogleCandidate(session: FullPageSession, candidate: Translation
     )) return;
     const slots = collectLiveTranslationTextSlots(candidate.element, core.shouldStayOriginal, undefined, protectionOptions);
     if (slots.length === 0) return;
+    const origins = slots.map(slot => slot.source);
+    if (!canPrimeNativeGoogleSlots(origins, session.translationConfig)) return;
+    if (existing) {
+        const exactSameSlots = existing.origins.length === origins.length
+            && existing.origins.every((origin, index) => origin === origins[index]);
+        if (existing.source === source && existing.candidate.scope === candidate.scope && exactSameSlots) {
+            existing.candidate = candidate;
+            return;
+        }
+        cancelPreparedCandidate(session, existing.candidate);
+    }
     const slotCount = slots.length;
     const escapedCharacters = slots.reduce((total, slot) => total + googleEscapedTextLength(slot.source), 0);
     const oversizedSingle = slotCount === 1 && escapedCharacters > FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS;
@@ -826,46 +813,163 @@ function prepareGoogleCandidate(session: FullPageSession, candidate: Translation
 
     const controller = new AbortController();
     const entry: PreparedCandidate = {candidate, controller, source, slots: slotCount, escapedCharacters,
+        origins,
+        nativeGooglePrimeProof: {origins, invocationIdentity: getTranslationInvocationIdentity(session.translationConfig)},
         settled: false, consumed: false};
     session.preparedCandidates.set(key, entry);
     session.preparedSlots += slotCount;
     session.preparedEscapedCharacters += escapedCharacters;
-    const request = createTranslationRequest(candidate.element, candidate.kind, session.translationConfig.displayMode,
-        session.translationConfig, controller.signal, createTranslationQueueSession(), session, protectionOptions,
-        false, candidate.scope);
-    void request.then(
-        () => {
-            entry.settled = true;
-            if (entry.consumed || session.scheduled.get(key) !== candidate) releasePreparedCandidate(session, key, entry);
-        },
-        () => releasePreparedCandidate(session, key, entry),
-    );
 }
 
-function prepareGoogleDispatchPlan(session: FullPageSession, plan: FullPageDispatchPlan, startedAt: number): void {
-    for (const {candidate} of plan.candidates) {
-        if (performance.now() - startedAt >= 8) break;
-        prepareGoogleCandidate(session, candidate);
+function invalidateGoogleDispatchPlan(session: FullPageSession): void {
+    session.dispatchPlan = null;
+    session.prepareCursor = 0;
+    if (session.prepareTimer !== null) {
+        window.clearTimeout(session.prepareTimer);
+        session.prepareTimer = null;
     }
 }
 
-function consumePreparedCandidate(session: FullPageSession | undefined, candidate: TranslationCandidate, source: string): void {
-    if (!session) return;
+function shouldPrepareGoogleViewport(session: FullPageSession): boolean {
+    return session.translationMode === 'viewport'
+        && session.translationConfig.service === services.google
+        && session.translationConfig.enableNativeBatch !== false;
+}
+
+/** Initial IO delivery order is not an admission boundary. */
+function releaseInitialGoogleVisibleWave(session: FullPageSession): void {
+    if (session.googleInitialWaveDiscoveryReady) return;
+    session.observedCandidates.forEach((candidates, anchor) => {
+        if (!isAnchorVisible(anchor)) return;
+        candidates.forEach((candidate, key) => {
+            queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
+        });
+    });
+    session.googleInitialWaveDiscoveryReady = true;
+    invalidateGoogleDispatchPlan(session);
+}
+
+/** 初始 viewport group 只等到首屏之后的第一个可见锚点，不扫描远端全文。 */
+function releaseInitialViewportCommitGroup(session: FullPageSession): void {
+    if (session.viewportCommitDiscoveryReady) return;
+    session.observedCandidates.forEach((candidates, anchor) => {
+        if (!isAnchorVisible(anchor)) return;
+        candidates.forEach((candidate, key) => {
+            queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
+        });
+    });
+    session.viewportCommitDiscoveryReady = true;
+}
+
+function isAnchorVisible(anchor: HTMLElement): boolean {
+    try {
+        const rect = anchor.getBoundingClientRect();
+        const width = window.innerWidth || document.documentElement.clientWidth;
+        const height = window.innerHeight || document.documentElement.clientHeight;
+        return width > 0 && height > 0 && rect.width > 0 && rect.height > 0
+            && rect.right > 0 && rect.left < width && rect.bottom > 0 && rect.top < height;
+    } catch {
+        return false;
+    }
+}
+
+function isAnchorBelowViewport(anchor: HTMLElement): boolean {
+    try {
+        const rect = anchor.getBoundingClientRect();
+        const width = window.innerWidth || document.documentElement.clientWidth;
+        const height = window.innerHeight || document.documentElement.clientHeight;
+        return width > 0 && height > 0 && rect.right > 0 && rect.left < width && rect.top >= height;
+    } catch {
+        return false;
+    }
+}
+
+/** Google 첫 body wave가 collector 자리를 먼저 확정한 뒤 제목 요청을 시작한다. */
+function startFullPageTitleTranslationIfNeeded(session: FullPageSession): void {
+    if (session.titleTranslationStarted || config.pageTitleTranslationEnabled === false) return;
+    session.titleTranslationStarted = true;
+    startFullPageTitleTranslation(session.translationConfig);
+}
+
+function ensureGoogleDispatchPlan(session: FullPageSession, scrolling: boolean): FullPageDispatchPlan {
+    if (session.dispatchPlan) return session.dispatchPlan;
+    session.prepareCursor = 0;
+    session.dispatchPlan = createFullPageDispatchPlan(session, {now: Date.now(), viewportHeight: window.innerHeight, visibleOnly: scrolling,
+        isEligible: candidate => !session.modal || isWithinTranslationModal(session.modal, candidate.element),
+        resolveSource: candidateLifecycleSource});
+    return session.dispatchPlan;
+}
+
+function prepareGoogleDispatchPlan(session: FullPageSession, startedAt: number): boolean {
+    const plan = session.dispatchPlan;
+    if (!plan) return true;
+    while (session.prepareCursor < plan.candidates.length && performance.now() - startedAt < 8) {
+        const selection = plan.candidates[session.prepareCursor++]!;
+        if (session.pending.get(selection.key) !== selection.candidate
+            || session.inFlightCandidates.has(selection.key)) continue;
+        // 첫 wave의 transport 예산은 실제 화면에 보이는 본문에만 쓴다. near 후보는
+        // 기존 queue가 다음 drain에서 처리하므로 첫 결과를 밀어내지 않는다.
+        if (!isAnchorVisible(selection.candidate.element)) continue;
+        prepareGoogleCandidate(session, selection.candidate);
+        if (session.preparedSlots >= FULL_PAGE_PREPARE_MAX_TEXT_SLOTS
+            || session.preparedEscapedCharacters >= FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS) return true;
+    }
+    if (session.prepareCursor < plan.candidates.length) return false;
+    // 첫 IO callback은 discovery가 막 등록한 일부 anchor만 담을 수 있다. near-viewport
+    // 탐색이 끝나거나 네 요청의 준비 예산을 채울 때까지 기다립니다.
+    return session.googleInitialWaveDiscoveryReady;
+}
+
+function primePreparedGoogleWave(session: FullPageSession): boolean {
+    if (session.primedGoogleWave) return false;
+    const entries = [...session.preparedCandidates.values()].filter(entry => !entry.consumed && !entry.controller.signal.aborted);
+    const origins = entries.flatMap(entry => entry.origins);
+    if (origins.length === 0) return false;
+    const controller = new AbortController();
+    session.requestControllers.add(controller);
+    const request = primeNativeGooglePageSlots(origins, session.translationConfig, session, controller.signal);
+    startFullPageTitleTranslationIfNeeded(session);
+    session.primedGoogleWave = request;
+    session.primedGoogleWaveController = controller;
+    session.primedGoogleWaveMembers = entries;
+    const releaseWave = () => {
+        session.requestControllers.delete(controller);
+        if (session.primedGoogleWave === request) {
+            session.primedGoogleWave = null;
+            session.primedGoogleWaveController = null;
+            session.primedGoogleWaveMembers = null;
+        }
+    };
+    void request.then(
+        () => entries.forEach(entry => {
+            entry.settled = true;
+            const key = getTranslationCandidateKey(entry.candidate);
+            if (entry.consumed || session.scheduled.get(key) !== entry.candidate) releasePreparedCandidate(session, key, entry);
+        }),
+        () => entries.forEach(entry => releasePreparedCandidate(session, getTranslationCandidateKey(entry.candidate), entry)),
+    ).then(releaseWave, releaseWave);
+    return true;
+}
+
+function consumePreparedCandidate(session: FullPageSession | undefined, candidate: TranslationCandidate, source: string): PreparedCandidate | undefined {
+    if (!session) return undefined;
     const key = getTranslationCandidateKey(candidate);
     const entry = session.preparedCandidates.get(key);
-    if (!entry) return;
+    if (!entry) return undefined;
     if (entry.source !== source || entry.candidate !== candidate) {
         cancelPreparedCandidate(session, entry.candidate);
-        return;
+        return undefined;
     }
     entry.consumed = true;
     if (entry.settled) releasePreparedCandidate(session, key, entry);
+    return entry;
 }
 
 function forgetCandidate(session: FullPageSession | undefined, candidate: TranslationCandidate): void {
     if (!session) return;
-    cancelPreparedCandidate(session, candidate);
     const key = getTranslationCandidateKey(candidate);
+    session.viewportCommitTickets.get(key)?.cancel();
+    cancelPreparedCandidate(session, candidate);
     const removedPending = removeFullPagePending(session, key, candidate);
     if (session.scheduled.get(key) !== candidate) {
         if (removedPending) scheduleFullPageProgressPublish(session);
@@ -881,6 +985,7 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
     owner?: FullPageSession,
     translationConfigOverride?: FullPageTranslationConfigSnapshot,
     forceFailedRequest = false,
+    viewportCommitTicket?: ViewportCommitTicket,
 ): Promise<TranslationTargetOutcome> {
     if (!candidate.element.isConnected) return {status: "not-current"};
     const statefulSession = owner?.active ? owner : fullPageSession?.active ? fullPageSession : undefined;
@@ -998,7 +1103,7 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
             translationConfig.targetLanguage, translationConfig.excludedLanguages)) {
         return {status: "unchanged", source: sourceText};
     }
-    consumePreparedCandidate(statefulSession, candidate, sourceText);
+    const preparedCandidate = consumePreparedCandidate(statefulSession, candidate, sourceText);
 
     if (candidate.visualRange) {
         const visualCandidate = withFullPageViewportAnchor(
@@ -1018,6 +1123,7 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
         ? withFullPageViewportAnchor(() => materializeCandidate(candidate), [candidate.element])
         : materializeCandidate(candidate);
     if (!materialized) {
+        if (preparedCandidate && statefulSession) cancelPreparedCandidate(statefulSession, candidate);
         return {
             status: "not-current",
             retryRoot: candidate.element.isConnected ? candidate.element : undefined,
@@ -1048,10 +1154,20 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
         candidate.scope,
     );
     if (!attempt) {
+        if (preparedCandidate && statefulSession) cancelPreparedCandidate(statefulSession, candidate);
         if (synthetic) {
             withFullPageViewportAnchor(() => node.replaceWith(...Array.from(node.childNodes)), [node]);
         }
         return {status: "owned"};
+    }
+    viewportCommitTicket?.bindAttempt(() => {discardStaleAttempt(node, attempt.state);});
+    if (preparedCandidate) {
+        // 준비 lease는 이제 실제 DOM attempt controller를 따른다. 한 후보의 취소는
+        // 자신의 lease만 반납하고, 마지막 owner가 사라질 때만 공유 wave를 중단한다.
+        attempt.state.controller.signal.addEventListener('abort', () => {
+            preparedCandidate.controller.abort();
+            if (statefulSession) abortGooglePrimeWithoutMembers(statefulSession);
+        }, {once: true});
     }
     // 请求必须在 spinner 插入前创建；微软 HTML 克隆和文本节点快照不能把
     // 插件自己的 loading 元素送到服务端。
@@ -1072,10 +1188,11 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
         requestProtectionOptions,
         forceFailedRequest,
         candidate.scope,
+        preparedCandidate?.nativeGooglePrimeProof,
     )
         .finally(() => { signal.removeEventListener('abort', cancelQueuedRequest); releaseRequestSession(); });
     if (synthetic) node.setAttribute('data-fr-translation-segment', 'true');
-    const cancelLoading = scheduleTranslationLoadingIndicator(node, attempt.state, Boolean(owner));
+    const cancelLoading = scheduleTranslationLoadingIndicator(node, attempt.state, Boolean(owner), isViewportCommitGroupEnabled());
     registerSessionStatefulTarget(statefulSession, candidate.element, node);
     const outcome = await renderTranslation(
         node,
@@ -1086,8 +1203,9 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
         requestSession,
         requestCommitGeneration,
         requestOwner,
+        viewportCommitTicket,
     ).finally(() => { if (statefulSession) scheduleFullPageProgressPublish(statefulSession); });
-    if ((outcome.status === "stale" || outcome.status === "not-current" || outcome.status === "empty" ||
+    if ((outcome.status === "stale" || outcome.status === "not-current" || outcome.status === "empty" || outcome.status === "deferred" ||
         outcome.status === "unchanged") && (!getTranslationState(node) || getTranslationState(node) === attempt.state)) {
         unregisterSessionStatefulTarget(statefulSession, node);
     }
@@ -1134,6 +1252,12 @@ function finalizeFullPageCandidate(
     // mutation 重启或更新的发现 generation 可能已替换 scheduled 条目；
     // 旧 provider 结果不能删除新 owner，也不能替它重新排队。
     if (!session.active || fullPageSession !== session || session.scheduled.get(originalKey) !== candidate) return;
+    // 离开预取区只撤销此次 attempt；保留 IO 归属，重新进入后再派发。
+    if (outcome.status === 'deferred') return;
+    if (isViewportCommitGroupEnabled() && session.translationMode === 'viewport' && outcome.status === 'stale') {
+        const anchor = session.candidateAnchors.get(originalKey);
+        if (anchor && !isAnchorNearViewport(anchor)) return;
+    }
 
     if (outcome.status !== "stale" && outcome.status !== "not-current" && outcome.status !== "empty") {
         session.lifecycleRetries.delete(originalKey);
@@ -1219,6 +1343,91 @@ function scheduleFullPageDrain(session: FullPageSession): void {
     }, session.scrollController.isScrolling ? 120 : 0);
 }
 
+function createViewportCommitTicket(session: FullPageSession, key: Node,
+    group: ViewportCommitGroup<ViewportCommitEntry>): ViewportCommitTicket {
+    let phase: 'pending' | 'staged' | 'complete' = 'pending';
+    let resolve: ((outcome: TranslationTargetOutcome) => void) | undefined;
+    let cancelPlan: (() => void) | undefined;
+    const ticket: ViewportCommitTicket = {
+        bindAttempt(cancel): void {cancelPlan = cancel;},
+        isStaged: () => phase === 'staged',
+        settleFailure(): void {
+            if (phase === 'complete') return;
+            phase = 'complete';
+            session.viewportCommitTickets.delete(key);
+            group.withdraw(key);
+        },
+        stage(node, plan): Promise<TranslationTargetOutcome> {
+            if (phase !== 'pending') return Promise.resolve({status: session.active ? 'deferred' : 'stale'});
+            phase = 'staged';
+            cancelPlan = plan.cancel;
+            session.inFlightCandidates.delete(key);
+            scheduleFullPageProgressPublish(session);
+            scheduleFullPageDrain(session);
+            return new Promise<TranslationTargetOutcome>((done) => {
+                resolve = done;
+                group.settle(key, {
+                    key,
+                    node,
+                    isCurrent: plan.isCurrent,
+                    commit: plan.commit,
+                    cancel: plan.cancel,
+                    isActive: () => phase === 'staged' && session.active && fullPageSession === session,
+                    resolve: done,
+                });
+            });
+        },
+        cancel(): void {
+            if (phase === 'complete') return;
+            phase = 'complete';
+            session.inFlightCandidates.delete(key);
+            session.viewportCommitTickets.delete(key);
+            cancelPlan?.();
+            resolve?.({status: session.active ? 'deferred' : 'stale'});
+            group.withdraw(key);
+        },
+    };
+    session.viewportCommitTickets.set(key, ticket);
+    return ticket;
+}
+
+function createViewportCommitGroupForPlan(session: FullPageSession, plan: FullPageDispatchPlan): void {
+    if (!isViewportCommitGroupEnabled() || session.translationMode !== 'viewport' ||
+        !session.viewportCommitDiscoveryReady || session.viewportCommitTickets.size > 0) return;
+    const visible = plan.candidates.filter(({priority}) => priority.band === 'visible');
+    if (visible.length === 0) return;
+    let group!: ViewportCommitGroup<ViewportCommitEntry>;
+    group = createViewportCommitGroup((entries) => {
+        session.viewportCommitGroups.delete(group);
+        const validEntries = entries.filter(entry =>
+            entry.isActive() && session.active && fullPageSession === session && entry.isCurrent());
+        entries.forEach(entry => {
+            session.viewportCommitTickets.delete(entry.key);
+            if (!validEntries.includes(entry)) {
+                entry.cancel();
+                entry.resolve({status: 'stale'});
+            }
+        });
+        if (validEntries.length === 0) return;
+        withFullPageViewportAnchor(() => {
+            validEntries.forEach(entry => entry.resolve(entry.commit()));
+        }, validEntries.map(({node}) => node));
+    });
+    session.viewportCommitGroups.add(group);
+    visible.forEach(({key}) => {
+        if (!session.viewportCommitTickets.has(key)) createViewportCommitTicket(session, key, group);
+        group.reserve(key);
+    });
+    group.seal();
+}
+function scheduleGooglePreparationSlice(session: FullPageSession): void {
+    if (!session.active || session.prepareTimer !== null) return;
+    session.prepareTimer = window.setTimeout(() => {
+        session.prepareTimer = null;
+        drainFullPage(session);
+    }, 0);
+}
+
 function refreshFullPageModal(session: FullPageSession): void {
     refreshModalSession(session, {
         forget: candidate => forgetCandidate(session, candidate),
@@ -1233,6 +1442,10 @@ function refreshFullPageModal(session: FullPageSession): void {
 
 function drainFullPage(session: FullPageSession): void {
     if (!session.active || session.draining) return;
+    if (isViewportCommitGroupEnabled() && session.translationMode === 'viewport' && !session.viewportCommitDiscoveryReady) {
+        scheduleFullPageProgressPublish(session);
+        return;
+    }
     const scrolling = session.scrollController.isScrolling;
     refreshFullPageModal(session);
     session.draining = true;
@@ -1240,31 +1453,59 @@ function drainFullPage(session: FullPageSession): void {
     const startedAt = performance.now();
     let scrollingDispatches = 0;
     let needsAnotherSlice = false;
+    const preparesGoogleViewport = shouldPrepareGoogleViewport(session);
 
-    // 有空闲槽时才集中测量锚点；一轮派发内复用，避免 loading 写入后重复读取布局。
+    // Google viewport은 DOM lifecycle 전에 exact slot을 bounded batch로 prime한다.
     let plan: FullPageDispatchPlan | undefined;
-    while (session.active && session.inFlightCandidates.size < maxConcurrent && session.pending.size > 0) {
-        if (!plan) {
-            plan = createFullPageDispatchPlan(session, {now: Date.now(), viewportHeight: window.innerHeight, visibleOnly: scrolling,
+    let prepared = !preparesGoogleViewport;
+    let primingStarted = false;
+    if (preparesGoogleViewport && session.pending.size > 0) {
+        plan = ensureGoogleDispatchPlan(session, scrolling);
+        prepared = prepareGoogleDispatchPlan(session, startedAt);
+        if (prepared) primingStarted = primePreparedGoogleWave(session);
+    }
+    plan ??= session.pending.size > 0
+        ? createFullPageDispatchPlan(session, {now: Date.now(), viewportHeight: window.innerHeight, visibleOnly: scrolling,
+            isEligible: candidate => !session.modal || isWithinTranslationModal(session.modal, candidate.element),
+            resolveSource: candidateLifecycleSource})
+        : undefined;
+    if (plan) createViewportCommitGroupForPlan(session, plan);
+    // prime이 cache entry를 먼저 등록한 뒤에는 DOM lifecycle이 바로 그 promise를 소비한다.
+    // 따라서 첫 frame에서도 사용자 maxConcurrent만큼 loading을 만들되 HTTP wave는 쪼개지 않는다.
+    while (session.active && prepared
+        && session.inFlightCandidates.size < maxConcurrent && session.pending.size > 0) {
+        plan ??= preparesGoogleViewport
+            ? ensureGoogleDispatchPlan(session, scrolling)
+            : createFullPageDispatchPlan(session, {now: Date.now(), viewportHeight: window.innerHeight, visibleOnly: scrolling,
                 isEligible: candidate => !session.modal || isWithinTranslationModal(session.modal, candidate.element),
                 resolveSource: candidateLifecycleSource});
-            prepareGoogleDispatchPlan(session, plan, startedAt);
-        }
         const selection = plan.next();
-        if (!selection) break;
+        if (!selection) {
+            if (preparesGoogleViewport) invalidateGoogleDispatchPlan(session);
+            break;
+        }
         const {key, candidate, priority} = selection;
+        if (session.viewportCommitTickets.get(key)?.isStaged()) {
+            removeFullPagePending(session, key, candidate);
+            continue;
+        }
         if (session.pendingMetadata.get(key)?.retryIsCurrent?.() === false) {
             forgetCandidate(session, candidate);
             continue;
         }
         const forceFailedRequest = session.pendingMetadata.get(key)?.forceFailedRequest === true;
+        const viewportCommitTicket = session.viewportCommitTickets.get(key);
         removeFullPagePending(session, key, candidate);
         session.inFlightCandidates.set(key, candidate);
         if (priority.band === 'background') session.foregroundDispatchesSinceBackground = 0;
         else session.foregroundDispatchesSinceBackground += 1;
-        void translateTarget(candidate, session.translationConfig.displayMode, !forceFailedRequest, session, undefined, forceFailedRequest)
+        void translateTarget(candidate, session.translationConfig.displayMode, !forceFailedRequest, session, undefined, forceFailedRequest,
+            viewportCommitTicket)
             .then(
-                (outcome) => finalizeFullPageCandidate(session, candidate, outcome),
+                (outcome) => {
+                    if (outcome.status === 'failed') viewportCommitTicket?.settleFailure();
+                    finalizeFullPageCandidate(session, candidate, outcome);
+                },
                 () => {
                     // 意外 runtime 异常保留原有终止行为；provider 失败会由
                     // translateTarget 显式表示，并在到达此处前渲染重试 UI。
@@ -1287,6 +1528,22 @@ function drainFullPage(session: FullPageSession): void {
         }
     }
     session.draining = false;
+    // 먼 영역 discovery가 다음 8ms slice를 예약해도 초기 Google 준비 cursor는 독립적으로
+    // 이어져야 한다. 두 timer는 DOM을 쓰지 않는 bounded 작업이며 scroll/route invalidation이
+    // 같은 session의 plan을 폐기한다.
+    if (preparesGoogleViewport && !prepared && session.dispatchPlan
+        && session.prepareCursor < session.dispatchPlan.candidates.length) {
+        scheduleGooglePreparationSlice(session);
+    }
+    // body wave가 8ms preparation slice를 더 필요로 하면 title collector가 먼저 flush되어
+    // Google HTTP gate를 점유할 수 있다. body가 전혀 없거나 이번 plan 준비가 끝난 뒤에만
+    // fallback title을 시작한다. body wave를 만든 경로는 primePreparedGoogleWave()가 즉시 시작한다.
+    const noPendingGoogleBody = session.pending.size === 0 && session.preparedCandidates.size === 0;
+    if (preparesGoogleViewport && session.googleInitialWaveDiscoveryReady && !session.primedGoogleWave
+        && (prepared || noPendingGoogleBody)) {
+        startFullPageTitleTranslationIfNeeded(session);
+    }
+    if (primingStarted) scheduleFullPageDrain(session);
     if (needsAnotherSlice) scheduleFullPageDrain(session);
     scheduleFullPageProgressPublish(session);
 }
@@ -1446,6 +1703,9 @@ function upgradeFullPageTargetScope(session: FullPageSession, target: HTMLElemen
 function flushMutationRescans(session: FullPageSession): void {
     session.mutationFlushTimer = null;
     if (!session.active) return;
+    // 같은 generator의 다음 8ms slice는 이미 측정된 Google preparation cursor를 이어간다.
+    // 새 discovery root는 activeDiscovery가 비어 있을 때만 새 plan을 요구한다.
+    if (!session.activeDiscovery) invalidateGoogleDispatchPlan(session);
     const startedAt = performance.now();
     let nextDelay = 16;
 
@@ -1499,6 +1759,12 @@ function flushMutationRescans(session: FullPageSession): void {
         }
         if (step.value.candidate) scheduleDiscoveredCandidate(session, step.value.candidate);
 
+        // 첫 Google viewport wave는 전체 문서가 아니라 가까운 경계를 찾을 때까지만
+        // 8ms slice를 이어간다. 이후에는 기존 16ms discovery cadence로 돌아간다.
+        if (shouldPrepareGoogleViewport(session)) {
+            nextDelay = session.googleInitialWaveDiscoveryReady ? 16 : 0;
+        }
+
         // 每一步最多代表一个已访问元素；即使脏根覆盖整个 Reddit/Wikipedia DOM，
         // 也要在很小的帧预算后让出执行权。
         if (performance.now() - startedAt >= 8) break;
@@ -1508,6 +1774,10 @@ function flushMutationRescans(session: FullPageSession): void {
         session.mutationFlushTimer = window.setTimeout(() => flushMutationRescans(session), nextDelay);
     } else {
         session.dirtyRootsBroadMode = false;
+        if (shouldPrepareGoogleViewport(session)) releaseInitialGoogleVisibleWave(session);
+        if (isViewportCommitGroupEnabled() && session.translationMode === 'viewport') {
+            releaseInitialViewportCommitGroup(session);
+        }
     }
     scheduleFullPageDrain(session);
 }
@@ -1517,578 +1787,6 @@ function observeFullPageRoot(session: FullPageSession, root: Node): void {
     session.roots.add(root);
     session.modalDirty = true;
     session.mutationObserver.observe(root, createTranslationMutationObserverOptions(getCurrentTranslationCore(session.scope).adapters));
-}
-
-function resolveStatefulMutationTarget(element: Element): HTMLElement | false {
-    let current: Element | null = element;
-    while (current) {
-        const htmlCurrent = asHTMLElement(current);
-        if (htmlCurrent && getTranslationState(htmlCurrent)) return htmlCurrent;
-        current = current.parentElement;
-    }
-    return false;
-}
-
-/**
- * materialize 的 childList 可在延迟 spinner 创建前送达；尚未创建允许零产物，已登记则必须保持唯一归属。
- * 这些真实 childList 记录会在 beginTranslation 之后、异步 provider 仍待完成时送达。
- * 只有本 generation 捕获的精确来源所有权、HTML 和 Text 槽身份都保持完整时才接受；
- * 任何宿主插入（包括伪装成 FluentRead 产物的节点）都必然无法通过至少一项检查，
- * 并继续进入 stale/重启路径。
- */
-function isIntactLoadingSyntheticChildList(
-    target: HTMLElement,
-    state: TranslationState,
-): boolean {
-    if (!state.syntheticSegment || !target.matches('[data-fr-translation-segment="true"]')) return false;
-    const spinner = state.spinner;
-    if (spinner !== undefined && (spinner.parentNode !== target || !spinner.matches('[data-fr-translation-owned="true"]'))) return false;
-
-    const expectedSourceNodes = state.syntheticSourceNodes;
-    if (!expectedSourceNodes) return false;
-    const currentSourceNodes = Array.from(target.childNodes).filter((node) => node !== spinner);
-    if (currentSourceNodes.length !== expectedSourceNodes.length ||
-        currentSourceNodes.some((node, index) => node !== expectedSourceNodes[index])) return false;
-
-    const artifacts = Array.from(target.querySelectorAll(TRANSLATION_ARTIFACT_SELECTOR));
-    if (artifacts.length !== (spinner === undefined ? 0 : 1) || (spinner !== undefined && artifacts[0] !== spinner)) return false;
-
-    const sourceClone = target.cloneNode(false) as HTMLElement;
-    currentSourceNodes.forEach((node) => sourceClone.appendChild(node.cloneNode(true)));
-    if (sourceClone.innerHTML !== state.sourceHTML) return false;
-
-    const expectedTextNodes = state.sourceTextNodes ?? [];
-    const currentTextNodes = getCurrentTranslationStateTextNodes(target, state);
-    return currentTextNodes.length === expectedTextNodes.length &&
-        currentTextNodes.every((node, index) => node === expectedTextNodes[index]);
-}
-
-function isOwnMutation(
-    mutation: MutationRecord,
-    loadingSyntheticChecks: WeakMap<TranslationState, boolean>,
-): boolean {
-    const mutationElement = mutationTargetElement(mutation.target);
-    // 框架在 hover/render 时会重复写入相同属性。相同值没有来源或展示变化，
-    // 不能让一次 setAttribute 事务把控件/仅译文恢复后再从缓存重新渲染。
-    // oldValue 为 null 时仍走完整复验，兼容不提供旧值的观察器实现。
-    if (mutation.type === "attributes" && mutationElement && mutation.attributeName &&
-        mutation.oldValue !== null &&
-        mutation.oldValue === mutationElement.getAttribute(mutation.attributeName)) return true;
-    if (mutation.type === "attributes" && mutationElement && (
-        (mutation.attributeName === "style" && isTranslationLayoutOverrideMutation(mutationElement as HTMLElement)) ||
-        (mutation.attributeName === "class" && consumeOrphanedOwnerClassMutation(mutationElement as HTMLElement)))) return true;
-    // 不能用“位于任意插件节点内”作为判断：站点可能直接改写双语 wrapper
-    // 的文本，必须让这类 mutation 进入 stale/retranslate 分支。加载/错误节点
-    // 没有宿主正文，才可以直接视为插件自身变化。
-    if (mutation.type !== "childList" &&
-        isElementNode(mutation.target) &&
-        mutation.target.matches('[data-fr-translation-owned="true"]') &&
-        !mutation.target.matches('.fluent-read-bilingual-content')) return true;
-    const target = mutationElement ? resolveStatefulMutationTarget(mutationElement) : false;
-    const state = target ? getTranslationState(target as HTMLElement) : undefined;
-    if (!target || !state) return false;
-    if (isOwnSyntheticSegmentMarkerMutation(mutation, target, state,
-        () => statefulSourceAndTextSlotsAreCurrent(target, state))) return true;
-    if (isOwnStateArtifactMutation(mutation, target, state)) return true;
-    if (state.phase === "error") {
-        // 失败 UI 是扩展拥有的状态，不是宿主编辑；若缺少此分支，其 class mutation
-        // 会恢复并重扫目标，使永久 provider 错误变成自动无限重试。
-        if (mutation.type === "attributes" && mutationElement === target && mutation.attributeName === "class") {
-            return target.getAttribute("class") === state.renderedClassAttribute;
-        }
-        if (mutation.type === "attributes" && mutationElement === target && mutation.attributeName === "style") {
-            return target.getAttribute("style") === state.renderedStyleAttribute;
-        }
-        if (mutation.type === "childList") {
-            return allMutationNodesMatch(mutation, isTranslationArtifact) &&
-                mutationElement === target &&
-                state.retryWrapper?.parentNode === target;
-        }
-        return false;
-    }
-    if (state.phase === "loading") {
-        // 手动重试会在 beginTranslation 创建下一 generation 前立即移除旧失败 class。
-        // mutation 异步送达，因此需依据新快照识别这次清理。
-        if (mutation.type === "attributes" && mutationElement === target && mutation.attributeName === "class") {
-            return target.getAttribute("class") === state.originalClassAttribute;
-        }
-        if (mutation.type === "attributes" && mutationElement === target && mutation.attributeName === "style") {
-            return target.getAttribute("style") === state.originalStyleAttribute;
-        }
-        if (mutation.type === "childList" && mutationElement === target) {
-            const cached = loadingSyntheticChecks.get(state);
-            if (cached !== undefined) return cached;
-            const intact = isIntactLoadingSyntheticChildList(target, state);
-            loadingSyntheticChecks.set(state, intact);
-            return intact;
-        }
-        return false;
-    }
-    if (state.phase !== "translated") return false;
-    if (isOwnSingleTextSlotMove(mutation, target, state)) return true;
-    if (state.mode === "single" && mutation.type === "characterData") {
-        const textNode = mutation.target as Text;
-        return state.textSlotsApplied === true &&
-            state.translatedTextValues?.get(textNode) === (textNode.nodeValue ?? "");
-    }
-    if (state.bilingualContent?.isConnected) {
-        const wrapper = state.bilingualContent;
-        const mutationParent = isElementNode(mutation.target)
-            ? mutation.target
-            : mutation.target.parentElement;
-
-        // wrapper 内部的变化只有在内容仍等于插件最后写入的快照时才算插件自身；
-        // 如果站点脚本改写了译文，必须让后续分支恢复并重新排队。
-        if (mutationParent && (mutationParent === wrapper || wrapper.contains(mutationParent))) {
-            return wrapper.outerHTML === state.bilingualOuterHTML;
-        }
-
-        // 插件会先插入 loading，完成后再移除 loading 并插入译文 wrapper。
-        // 这两类 childList mutation 都可能落在宿主节点上；只要所有增删节点
-        // 都是扩展 artifact，且插件自己的最终快照仍然存在，就不能触发重译。
-        // 若 wrapper 已被宿主移除，则保留 false，让后续逻辑恢复并重新排队。
-        if (mutation.type === "childList" && allMutationNodesMatch(mutation, isTranslationArtifact)) {
-            return state.bilingualContent?.parentNode === target &&
-                state.bilingualContent.outerHTML === state.bilingualOuterHTML;
-        }
-
-        // 双语渲染会临时修改宿主节点的 style；只有值仍是插件记录的值时才忽略。
-        if (mutation.type === "attributes" && mutationElement === target && mutation.attributeName === "style") {
-            return target.getAttribute("style") === state.renderedStyleAttribute;
-        }
-        if (mutation.type === "attributes" && mutationElement === target && mutation.attributeName === "class") {
-            return target.getAttribute("class") === state.renderedClassAttribute;
-        }
-    }
-    return isOwnCurrentArtifactAddition(mutation, state);
-}
-
-function removeScheduledForStateTarget(session: FullPageSession, target: HTMLElement): void {
-    const state = getTranslationState(target);
-    const host = state?.syntheticSegment ? target.parentElement : target;
-    const candidateElements = new Set<HTMLElement>([target]);
-    if (host) candidateElements.add(host);
-    for (const element of candidateElements) {
-        const keys = session.candidateOwnerKeys.get(element);
-        if (!keys) continue;
-        for (const key of Array.from(keys)) {
-            const candidate = session.scheduled.get(key);
-            if (!candidate) continue;
-            const matches = candidate.element === target || candidate.element === host ||
-                Boolean(candidate.nodes?.some((node) => target.contains(node)));
-            if (matches) forgetCandidate(session, candidate);
-        }
-    }
-}
-
-function runDisconnectedCandidatePrune(session: FullPageSession): void {
-    session.pruneTimer = null;
-    if (!session.active) return;
-    if (!session.pruneIterator) {
-        session.pruneIterator = session.scheduled.values();
-        session.pruneRequested = false;
-    }
-    const startedAt = performance.now();
-
-    while (session.pruneIterator) {
-        const next = session.pruneIterator.next();
-        if (next.done) {
-            session.pruneIterator = null;
-            if (session.pruneRequested && session.pruneTimer === null) {
-                session.pruneTimer = window.setTimeout(() => runDisconnectedCandidatePrune(session), 0);
-            }
-            return;
-        }
-        const candidate = next.value;
-        if (!candidate.element.isConnected || candidate.nodes?.some((node) => !node.isConnected)) {
-            forgetCandidate(session, candidate);
-        } else {
-            const key = getTranslationCandidateKey(candidate);
-            const anchor = session.candidateAnchors.get(key);
-            if (anchor && !anchor.isConnected) {
-                refreshCandidateVisibilityBinding(session, key, candidate);
-            }
-        }
-        if (performance.now() - startedAt >= CANDIDATE_PRUNE_BUDGET_MS) break;
-    }
-
-    if (session.pruneIterator && session.pruneTimer === null) {
-        session.pruneTimer = window.setTimeout(() => runDisconnectedCandidatePrune(session), 16);
-    }
-}
-
-function scheduleDisconnectedCandidatePrune(session: FullPageSession): void {
-    if (!session.active) return;
-    session.pruneRequested = true;
-    if (session.pruneTimer !== null || session.pruneIterator) return;
-    session.pruneTimer = window.setTimeout(() => runDisconnectedCandidatePrune(session), 0);
-}
-
-function discardOwnersRemovedByHost(
-    session: FullPageSession,
-    removedNodes: readonly Node[],
-    resolveRemovedOwners: RemovedTranslationOwnerResolver = getTranslationOwnersForRemovedNode,
-    beforeHostWrite?: () => void,
-): {removedAny: boolean; shouldRescan: boolean} {
-    const owners = new Set<HTMLElement>();
-    let shouldRescan = false;
-    removedNodes.forEach((removed) => {
-        const syntheticParent = removed.parentElement;
-        const syntheticState = syntheticParent?.matches('[data-fr-translation-segment="true"]')
-            ? getTranslationState(syntheticParent as HTMLElement)
-            : undefined;
-        // materializeCandidate 会在 MutationObserver 送达前把直属行内段移入自有片段；
-        // 后代翻译 owner 仍存活于该精确片段中，不能当作宿主删除。
-        if (removed.isConnected && syntheticState?.syntheticSegment === true) return;
-        resolveRemovedOwners(removed).forEach((owner) => owners.add(owner));
-    });
-    if (owners.size > 0) beforeHostWrite?.();
-    owners.forEach((owner) => {
-        const state = getTranslationState(owner);
-        if (!state) {
-            unregisterSessionStatefulTarget(session, owner);
-            return;
-        }
-        const removedOnlyFailureUi = state.phase === "error" &&
-            owner.isConnected &&
-            Boolean(state.retryWrapper) &&
-            removedNodes.length === 1 &&
-            removedNodes[0] === state.retryWrapper;
-        const attributeTimer = session.statefulAttributeTimers.get(owner);
-        if (attributeTimer !== undefined) {
-            window.clearTimeout(attributeTimer.timer);
-            if (attributeTimer.boundaryTimer !== undefined) window.clearTimeout(attributeTimer.boundaryTimer);
-            session.statefulAttributeTimers.delete(owner);
-        }
-        session.statefulAttributeRescanTargets.delete(owner);
-        if (removedOnlyFailureUi) {
-            // 保留错误墓碑；否则框架移除重试子节点后，下一次无关 mutation 会永远
-            // 自动请求同一个持续失败的 provider。
-            removeScheduledForStateTarget(session, owner);
-            detachFailedTranslationUi(owner, state);
-            return;
-        }
-        const disposition = state.phase === 'translated' && state.mode === 'bilingual' && state.kind === 'content'
-            ? stabilizeBilingualArtifact(owner, state, session.bilingualRemountCapitulations, ensureTranslationTruncationLayout) : 'retry';
-        if (disposition === 'current') return;
-        if (disposition === 'capitulated') {
-            unregisterSessionStatefulTarget(session, owner);
-            removeScheduledForStateTarget(session, owner);
-            withFullPageViewportAnchor(() => discardTranslation(owner, state), [owner]);
-            shouldRescan = true;
-            return;
-        }
-        if (canKeepTranslationAttempt(owner, state, attemptSourceIsCurrent,
-            statefulSourceAndTextSlotsAreCurrent)) {
-            // 虚拟列表可能在请求仍进行时替换 spinner 或来源 Text，但当前
-            // tweet/段落的语义原文没有变化。保留当前 generation，让结果提交到
-            // 新的实时 DOM；否则每次滚动都会先 abort 再重新翻译。
-            return;
-        }
-        if (session.scrollController.defer(owner)) {
-            // 滚动期间虚拟列表可能暂时拆掉当前 wrapper/来源节点。把重启推迟到
-            // scroll idle，避免用户看到原文、译文来回闪烁并避免取消正在进行的请求。
-            return;
-        }
-        unregisterSessionStatefulTarget(session, owner);
-        shouldRescan = true;
-        removeScheduledForStateTarget(session, owner);
-        // 宿主删除具有权威性：清除扩展状态/产物，但不重新挂回框架有意移除的旧来源节点。
-        withFullPageViewportAnchor(() => discardTranslation(owner, state), [owner]);
-    });
-    return {removedAny: owners.size > 0, shouldRescan};
-}
-
-function restartStatefulTarget(session: FullPageSession, target: HTMLElement): boolean {
-    const attributeTimer = session.statefulAttributeTimers.get(target);
-    if (attributeTimer !== undefined) {
-        window.clearTimeout(attributeTimer.timer);
-        if (attributeTimer.boundaryTimer !== undefined) window.clearTimeout(attributeTimer.boundaryTimer);
-        session.statefulAttributeTimers.delete(target);
-    }
-    session.statefulAttributeRescanTargets.delete(target);
-    unregisterSessionStatefulTarget(session, target);
-    const state = getTranslationState(target);
-    if (!state) return false;
-    if (session.scrollController.defer(target)) {
-        return false;
-    }
-    const disposition = state.phase === 'translated' && state.mode === 'bilingual' && state.kind === 'content'
-        ? stabilizeBilingualArtifact(target, state, session.bilingualRemountCapitulations, ensureTranslationTruncationLayout) : 'retry';
-    if (disposition === 'current') {
-        registerSessionStatefulTarget(session, target, target);
-        return false;
-    }
-    if (disposition === 'capitulated') {
-        removeScheduledForStateTarget(session, target);
-        withFullPageViewportAnchor(() => restoreTranslation(target), [target]);
-        return true;
-    }
-    // 显式来源/结构 mutation 属于新的 DOM generation；缓存仍按完整文本身份
-    // 复用，只有依赖周边页面内容的 AI 上下文结果需全量失效。
-    invalidateContextSensitiveRequestCache(session);
-    const rescanRoot = state.syntheticSegment ? target.parentElement : target;
-    removeScheduledForStateTarget(session, target);
-
-    if (state.phase === "loading") {
-        withFullPageViewportAnchor(() => discardTranslation(target, state), [target]);
-    } else {
-        withFullPageViewportAnchor(() => restoreTranslation(target), [target]);
-    }
-    if (rescanRoot?.isConnected) enqueueFullPageRescan(session, rescanRoot);
-    return true;
-}
-
-function scheduleStatefulAttributeReevaluation(
-    session: FullPageSession,
-    target: HTMLElement,
-    checkBoundary = false,
-): void {
-    const currentTimer = session.statefulAttributeTimers.get(target);
-    if (currentTimer !== undefined) window.clearTimeout(currentTimer.timer);
-    const scheduledState = getTranslationState(target);
-    const scheduledPhase = scheduledState?.phase;
-    const rescanRoot = scheduledState?.syntheticSegment ? target.parentElement : target;
-
-    const timer = window.setTimeout(() => {
-        const pending = session.statefulAttributeTimers.get(target);
-        if (pending?.timer !== timer) return;
-        session.statefulAttributeTimers.delete(target);
-        if (pending.boundaryTimer !== undefined) window.clearTimeout(pending.boundaryTimer);
-        if (!session.active) return;
-        const state = getTranslationState(target);
-        if (!state) {
-            if (session.statefulAttributeRescanTargets.has(target) && rescanRoot?.isConnected) {
-                session.statefulAttributeRescanTargets.delete(target);
-                enqueueFullPageRescan(session, rescanRoot);
-            }
-            return;
-        }
-        session.statefulAttributeRescanTargets.delete(target);
-        if (!target.isConnected) return;
-        if (pending.boundaryTimer !== undefined && restoreStatefulTargetOutsideScope(session, target)) return;
-
-        // A class/style reevaluation can be armed while the provider is still
-        // loading. If the host replaces equivalent source Text nodes before
-        // the request settles, do not let that old timer reinterpret the now
-        // successfully committed translation as stale.
-        if (scheduledState === state && scheduledPhase === "loading" &&
-            hasCurrentTranslationSource(target, state, attemptSourceIsCurrent)) return;
-
-        // 同时比较逻辑来源与精确文本槽身份，使纯 class/style 抖动保持低成本，
-        // 又能发现同文本标签或行内链接替换。实时 single/control 文本槽比较本
-        // generation 写入的值，而不是其旧原文。
-        const shouldReconcileBilingualLayout =
-            state.phase === "translated" &&
-            state.mode === "bilingual" &&
-            state.kind === "content" &&
-            state.bilingualContent?.isConnected;
-        if (shouldReconcileBilingualLayout && !ensureTranslationTruncationLayout(target)) {
-            restartStatefulTarget(session, target);
-            return;
-        }
-        let sourceCurrent = statefulSourceAndTextSlotsAreCurrent(target, state);
-        if (!sourceCurrent && withFullPageViewportAnchor(() =>
-            refreshBilingualTranslationSkeleton(target, state), [target])) sourceCurrent = true;
-        if ((sourceCurrent &&
-            (state.phase !== 'translated' || isTranslationArtifactCurrent(target, state))) ||
-            canKeepTranslationAttempt(target, state, attemptSourceIsCurrent,
-                statefulSourceAndTextSlotsAreCurrent)) return;
-        restartStatefulTarget(session, target);
-    }, STATEFUL_ATTRIBUTE_DEBOUNCE_MS);
-    const pending = {timer, boundaryTimer: currentTimer?.boundaryTimer};
-    // 来源/布局仍按最后一次变化防抖；边界检查按首次变化到期，避免动画一直延后清理。
-    if (checkBoundary && pending.boundaryTimer === undefined) {
-        const boundaryTimer = window.setTimeout(() => {
-            const current = session.statefulAttributeTimers.get(target);
-            if (current?.boundaryTimer !== boundaryTimer) return;
-            delete current.boundaryTimer;
-            if (!session.active) return;
-            if (restoreStatefulTargetOutsideScope(session, target)) {
-                window.clearTimeout(current.timer);
-                session.statefulAttributeTimers.delete(target);
-                session.statefulAttributeRescanTargets.delete(target);
-            }
-        }, STATEFUL_ATTRIBUTE_DEBOUNCE_MS);
-        pending.boundaryTimer = boundaryTimer;
-    }
-    session.statefulAttributeTimers.set(target, pending);
-}
-
-function resolveStatefulMutationTargets(
-    session: FullPageSession,
-    element: Element,
-): HTMLElement[] {
-    const targets = new Set<HTMLElement>();
-    const direct = resolveStatefulMutationTarget(element);
-    if (direct) targets.add(direct);
-    const descendants = session.statefulTargetsByAncestor.get(element);
-    if (descendants) {
-        for (const target of Array.from(descendants)) {
-            if (getTranslationState(target)) targets.add(target);
-            else unregisterSessionStatefulTarget(session, target);
-        }
-    }
-    return [...targets];
-}
-
-/** 结构或属性关系变化后，先取消已不在正文范围内的旧候选，再扫描新候选。 */
-function restoreStatefulTargetOutsideScope(session: FullPageSession, target: HTMLElement,
-    checks?: ReturnType<typeof createTranslationMutationStabilityChecks>): boolean {
-    const state = getTranslationState(target);
-    if (!state || state.syntheticSegment || (checks?.scopeIsCurrent(target, state) ??
-        isTranslationStateCandidateCurrent(target, state))) return false;
-    checks?.invalidate();
-    unregisterSessionStatefulTarget(session, target);
-    removeScheduledForStateTarget(session, target);
-    withFullPageViewportAnchor(() => restoreTranslation(target), [target]);
-    return true;
-}
-
-function createFullPageMutationObserver(
-    getSession: () => FullPageSession,
-): MutationObserver {
-    return new MutationObserver((mutations) => {
-        const session = getSession();
-        if (!session.active || fullPageSession !== session) return;
-        const core = getCurrentTranslationCore(session.scope);
-        const siteAttributes = getSiteAdapterAttributeFilter(core.adapters);
-        // materialize 较宽行内段时，每个被移动来源节点都可能排入一条 childList 记录。
-        // 精确快照在本次回调内稳定，因此每个 loading generation 只校验一次，
-        // 避免进行 O(records) 次克隆。
-        const loadingSyntheticChecks = new WeakMap<TranslationState, boolean>();
-        // MathJax v2 单次回调可能产生数百条直属父级记录。实时 DOM 此时已处于回调
-        // 最终状态，因此每个有状态来源/文本槽快照只比较一次，不为每条
-        // Preview <-> staging-span 记录反复遍历很长的 P。
-        const shouldCheckAttribute = createTranslationAttributeMutationFilter();
-        const resolveRemovedOwners = transferEquivalentBilingualOwners(session, mutations);
-        const stabilityReads = createTranslationMutationStabilityChecks();
-        const attributeBatch = createAttributeMutationBatch({
-            resolveTargets: root => resolveStatefulMutationTargets(session, root),
-            readState: getTranslationState,
-            restoreOutsideScope: target => restoreStatefulTargetOutsideScope(session, target, reads),
-            sourceIsCurrent: (target, state) => reads.sourceIsCurrent(target, state),
-            isArtifact: isTranslationArtifact,
-            refreshSkeleton: (target, state) => withFullPageViewportAnchor(() =>
-                (reads.invalidate(), refreshBilingualTranslationSkeleton(target, state)), [target]),
-            restart: target => {
-                reads.invalidate();
-                restartStatefulTarget(session, target);
-            },
-            rescan: root => enqueueFullPageRescan(session, root),
-            schedule: (target, boundary) => scheduleStatefulAttributeReevaluation(session, target, boundary),
-            isActive: () => session.active && fullPageSession === session,
-            hasTargetsOnlyAdapter: core.adapters.some(adapter => adapter.genericCandidatePolicy === 'targets-only'),
-        });
-        const reads = {
-            ...stabilityReads,
-            invalidate: () => {
-                stabilityReads.invalidate();
-                attributeBatch.invalidate();
-            },
-        };
-        for (const mutation of mutations) {
-            if (isOwnMutation(mutation, loadingSyntheticChecks)) continue;
-            const mutationElement = mutationTargetElement(mutation.target);
-            if (mutation.type === 'attributes' && mutationElement && mutation.attributeName &&
-                !shouldCheckAttribute(mutationElement, mutation.attributeName)) continue;
-            // spinner、译文写入和普通属性/文本变化不会让候选脱离文档。
-            // 只有真实宿主删除才启动全队列的分片清理，避免每次渲染遍历离屏候选。
-            if (mutation.type === 'childList' && mutation.removedNodes.length > 0) {
-                scheduleDisconnectedCandidatePrune(session);
-            }
-            if (mayChangeTranslationModal(mutation, session.modal)) session.modalDirty = true;
-            const siteAttributeMutation = mutation.type === 'attributes' && mutation.attributeName !== null &&
-                (siteAttributes === null || siteAttributes.includes(mutation.attributeName));
-            if (!siteAttributeMutation && mutation.type === 'attributes' && (mutation.attributeName === 'aria-modal' ||
-                (mutation.attributeName === 'open' && mutationElement?.localName === 'dialog'))) {
-                enqueueFullPageRescan(session, mutation.target); continue;
-            }
-            const preservesContext = isTextEquivalentHostReplacement(mutation);
-            const removedOwners = mutation.type === "childList"
-                ? discardOwnersRemovedByHost(session, Array.from(mutation.removedNodes), resolveRemovedOwners, reads.invalidate)
-                : {removedAny: false, shouldRescan: false};
-            if (removedOwners.shouldRescan && mutationElement) enqueueFullPageRescan(session, mutationElement);
-            if (mutationElement && core.shouldIgnoreMutation(mutationElement) &&
-                !siteAttributeMutation && !resolveStatefulMutationTarget(mutationElement)) continue;
-            if (!preservesContext) invalidateContextSensitiveRequestCache(session);
-            if (mutation.type === "childList") {
-                if (core.adapters.length && mutationElement) {
-                    const affectedRoot = siteAttributes === null ? document.documentElement : getComposedParent(mutationElement) ?? mutationElement;
-                    for (const target of resolveStatefulMutationTargets(session, affectedRoot)) restoreStatefulTargetOutsideScope(session, target, reads);
-                }
-                const changedTarget = mutationElement ? resolveStatefulMutationTarget(mutationElement) : false;
-                const changedState = changedTarget ? getTranslationState(changedTarget) : undefined;
-
-                // 宿主直属 childList 可能只是受保护 renderer 事务。可翻译来源与精确
-                // Text 槽不变时保留 loading/error/translated 所有权；旧行为会在
-                // MathJax v2 于父 P 替换脱离文档且无 class 的 staging span 后移除
-                // 已提交 wrapper。扩展当前产物内部或移除它的 mutation 仍属于
-                // 权威宿主篡改，必须立即重启。
-                if (changedTarget && changedState) {
-                    const touchesArtifact = isTranslationArtifact(mutation.target) ||
-                        mutationTouchesCurrentTranslationArtifact(mutation, changedState);
-                    let sourceAndSlotsCurrent = reads.sourceIsCurrent(changedTarget, changedState);
-                    if (!touchesArtifact && !sourceAndSlotsCurrent && withFullPageViewportAnchor(() =>
-                        (reads.invalidate(), refreshBilingualTranslationSkeleton(changedTarget, changedState)), [changedTarget])) {
-                        sourceAndSlotsCurrent = true;
-                    }
-                    const canKeepAttempt = canKeepTranslationAttempt(
-                        changedTarget,
-                        changedState,
-                        attemptSourceIsCurrent,
-                        statefulSourceAndTextSlotsAreCurrent,
-                        !touchesArtifact || isTranslationArtifactCurrent(changedTarget, changedState),
-                    );
-                    if ((touchesArtifact || !sourceAndSlotsCurrent) && !canKeepAttempt) {
-                        reads.invalidate();
-                        restartStatefulTarget(session, changedTarget);
-                    }
-                }
-
-                // 纯删除可能把原结构容器变成有效段落，因此所有情况都要重新分类 mutation 目标。
-                enqueueFullPageRescan(session, mutation.target);
-
-                // 扫描 mutation 目标已经覆盖全部新增后代；逐个排入子节点会把一次 React
-                // commit 扩大为数十个冗余脏根。
-            } else if (mutation.type === "characterData") {
-                const target = mutation.target.parentElement
-                    ? resolveStatefulMutationTarget(mutation.target.parentElement)
-                    : false;
-                if (target) {
-                    const state = getTranslationState(target);
-                    const touchesArtifact = isTranslationArtifact(mutation.target);
-                    let sourceCurrent = state && reads.sourceIsCurrent(target, state);
-                    if (state && !touchesArtifact && !sourceCurrent && withFullPageViewportAnchor(() =>
-                        (reads.invalidate(), refreshBilingualTranslationSkeleton(target, state)), [target])) sourceCurrent = true;
-                    if (!state || touchesArtifact || !sourceCurrent || !canKeepTranslationAttempt(
-                        target,
-                        state,
-                        attemptSourceIsCurrent,
-                        statefulSourceAndTextSlotsAreCurrent,
-                    )) {
-                        reads.invalidate();
-                        restartStatefulTarget(session, target);
-                    }
-                } else {
-                    // hydration 框架常在不新增 Element 的情况下追加/替换 Text 节点，
-                    // 此时需重新分类其最近语义块。
-                    enqueueFullPageRescan(session, mutation.target);
-                }
-            } else if (mutation.type === "attributes") {
-                if (!mutationElement) continue;
-
-                // 相邻选择器可能影响兄弟正文；不能穷举的关系选择器保守重扫文档，
-                // 后续发现仍受既有帧预算、去重与广域重扫冷却约束。
-                const affectedRoot = siteAttributeMutation
-                    ? siteAttributes === null ? document.documentElement : getComposedParent(mutationElement) ?? mutationElement
-                    : mutationElement;
-                attributeBatch.process(affectedRoot, mutationElement, mutation.target, mutation.attributeName, siteAttributeMutation);
-            }
-        }
-        refreshFullPageModal(session);
-        attributeBatch.flush();
-    });
 }
 
 function createFullPageSession(
@@ -2106,16 +1804,18 @@ function createFullPageSession(
             if (entry.isIntersecting) session.visibleCandidateAnchors.add(node);
             else session.visibleCandidateAnchors.delete(node);
             candidates.forEach((candidate, key) => {
-                if (entry.isIntersecting) {
+                if (entry.isIntersecting && (!isViewportCommitGroupEnabled() || session.translationMode !== 'viewport' || session.viewportCommitDiscoveryReady)) {
                     queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
                 } else {
                     // 快速划过的内容退出预取区后继续观察，等再次进入时才派发。
                     // 已交给 DOM 的请求继续；尚未消费的预准备则撤销，立即归还 32 槽/10k 预算。
                     removeFullPagePending(session, key, candidate);
+                    session.viewportCommitTickets.get(key)?.cancel();
                     if (!session.preparedCandidates.get(key)?.consumed) cancelPreparedCandidate(session, candidate);
                 }
             });
         }
+        invalidateGoogleDispatchPlan(session);
         scheduleFullPageProgressPublish(session);
         scheduleFullPageDrain(session);
     }, {
@@ -2172,6 +1872,19 @@ function createFullPageSession(
         preparedCandidates: new Map(),
         preparedSlots: 0,
         preparedEscapedCharacters: 0,
+        dispatchPlan: null,
+        prepareCursor: 0,
+        prepareTimer: null,
+        primedGoogleWave: null,
+        primedGoogleWaveController: null,
+        primedGoogleWaveMembers: null,
+        googleInitialWaveDiscoveryReady: false,
+        googleInitialWaveSawVisible: false,
+        viewportCommitDiscoveryReady: false,
+        viewportCommitInitialSawVisible: false,
+        viewportCommitGroups: new Set(),
+        viewportCommitTickets: new Map(),
+        titleTranslationStarted: false,
         ...createFullPageRequestSessionState(),
         draining: false,
         flushTimer: null,
@@ -2201,6 +1914,7 @@ function disposeFullPageSession(session: FullPageSession): void {
     session.modalDirty = false;
     disposeFullPageRequestSession(session, createAbortError());
     if (session.flushTimer !== null) window.clearTimeout(session.flushTimer);
+    if (session.prepareTimer !== null) window.clearTimeout(session.prepareTimer);
     if (session.mutationFlushTimer !== null) window.clearTimeout(session.mutationFlushTimer);
     if (session.pruneTimer !== null) window.clearTimeout(session.pruneTimer);
     session.scrollController.dispose();
@@ -2223,7 +1937,15 @@ function disposeFullPageSession(session: FullPageSession): void {
     session.inFlightCandidates.clear();
     session.userCancelledCandidates = new WeakMap();
     session.translationSlotCache.clear();
+    session.viewportCommitTickets.forEach(ticket => ticket.cancel());
+    session.viewportCommitGroups.forEach(group => group.dispose());
+    session.viewportCommitTickets.clear();
+    session.viewportCommitGroups.clear();
     clearPreparedCandidates(session);
+    session.primedGoogleWave = null;
+    session.primedGoogleWaveController = null;
+    session.primedGoogleWaveMembers = null;
+    invalidateGoogleDispatchPlan(session);
     session.dirtyRoots.clear();
     session.dirtyRootsBroadMode = false;
     session.activeDiscovery = null;
@@ -2247,7 +1969,21 @@ export function resetFullPageTranslationRouteState(): void {
     translationSourceStability.reset();
     hoverBilingualRemountCapitulations = createBilingualRemountCapitulationRegistry();
     invalidateHoverTranslationRequestSession();
-    if (fullPageSession?.active) clearPreparedCandidates(fullPageSession);
+    if (fullPageSession?.active) {
+        clearPreparedCandidates(fullPageSession);
+        fullPageSession.primedGoogleWave = null;
+        fullPageSession.primedGoogleWaveController = null;
+        fullPageSession.primedGoogleWaveMembers = null;
+        fullPageSession.googleInitialWaveDiscoveryReady = false;
+        fullPageSession.googleInitialWaveSawVisible = false;
+        fullPageSession.viewportCommitInitialSawVisible = false;
+        fullPageSession.viewportCommitDiscoveryReady = false;
+        fullPageSession.viewportCommitTickets.forEach(ticket => ticket.cancel());
+        fullPageSession.viewportCommitGroups.forEach(group => group.dispose());
+        fullPageSession.viewportCommitTickets.clear();
+        fullPageSession.viewportCommitGroups.clear();
+        invalidateGoogleDispatchPlan(fullPageSession);
+    }
     resetFullPageRouteSession(fullPageSession, document.documentElement, {
         observe: observeFullPageRoot,
         rescan: enqueueFullPageRescan,
@@ -2282,7 +2018,7 @@ export function autoTranslateEnglishPage(invocation: PageTranslationInvocation =
     fullPageSession = session;
     // 标题不在正文候选范围内（<head> 属硬裁剪标签），单独随会话翻译并跟随 SPA 改写；
     // 高级设置可关闭，关闭后标签页保持原标题。
-    if (config.pageTitleTranslationEnabled !== false) startFullPageTitleTranslation(session.translationConfig);
+    if (!shouldPrepareGoogleViewport(session)) startFullPageTitleTranslationIfNeeded(session);
     document.addEventListener('fluentread-open-shadow-root', (event) => {
         if (!session.active || fullPageSession !== session) return;
         const host = isElementNode(event.target as Node) ? event.target as Element : null;
@@ -2293,7 +2029,7 @@ export function autoTranslateEnglishPage(invocation: PageTranslationInvocation =
         refreshFullPageModal(session);
     }, {capture: true, signal: session.shadowEventController.signal});
     document.addEventListener('scroll', () => noteFullPageScroll(session, () => session.active && fullPageSession === session,
-        () => {session.scrollController.note(); scheduleFullPageDrain(session);}), {
+        () => {session.scrollController.note(); invalidateGoogleDispatchPlan(session); scheduleFullPageDrain(session);}), {
         capture: true,
         passive: true,
         signal: session.shadowEventController.signal,
@@ -2308,7 +2044,8 @@ export function autoTranslateEnglishPage(invocation: PageTranslationInvocation =
     for (const event of ['close', 'toggle', 'transitionend', 'animationend']) {
         document.addEventListener(event, refreshModal, {capture: true, signal: session.shadowEventController.signal});
     }
-    window.addEventListener('resize', refreshModal, {passive: true, signal: session.shadowEventController.signal});
+    window.addEventListener('resize', () => {invalidateGoogleDispatchPlan(session); refreshModal(); scheduleFullPageDrain(session);},
+        {passive: true, signal: session.shadowEventController.signal});
     observeFullPageRoot(session, root);
     for (const shadowRoot of getOpenShadowRoots(root)) observeFullPageRoot(session, shadowRoot);
     refreshFullPageModal(session);
