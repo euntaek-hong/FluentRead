@@ -80,7 +80,6 @@ export interface FullPageSession extends FullPageRequestSessionState, ModalPrior
     googleInitialWaveSawVisible: boolean;
     /** The first whole-viewport discovery pass must finish before it becomes one visual group. */
     viewportCommitDiscoveryReady: boolean;
-    viewportCommitInitialSawVisible: boolean;
     viewportCommitGroups: Set<ViewportCommitGroup<ViewportCommitEntry>>;
     viewportCommitTickets: Map<Node, ViewportCommitTicket>;
     titleTranslationStarted: boolean;

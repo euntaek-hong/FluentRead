@@ -672,12 +672,6 @@ function refreshCandidateVisibilityBinding(
             releaseInitialGoogleVisibleWave(session);
         }
     }
-    if (isViewportCommitGroupEnabled() && session.translationMode === 'viewport') {
-        if (isAnchorVisible(nextAnchor)) session.viewportCommitInitialSawVisible = true;
-        else if (session.viewportCommitInitialSawVisible && isAnchorBelowViewport(nextAnchor)) {
-            releaseInitialViewportCommitGroup(session);
-        }
-    }
 
     let observed = session.observedCandidates.get(nextAnchor);
     const alreadyObserved = Boolean(observed);
@@ -849,7 +843,7 @@ function releaseInitialGoogleVisibleWave(session: FullPageSession): void {
     invalidateGoogleDispatchPlan(session);
 }
 
-/** 初始 viewport group 只等到首屏之后的第一个可见锚点，不扫描远端全文。 */
+/** 多列页面的 DOM 顺序不等于屏幕顺序；初始发现完成后仅把可见锚点纳入提交组。 */
 function releaseInitialViewportCommitGroup(session: FullPageSession): void {
     if (session.viewportCommitDiscoveryReady) return;
     session.observedCandidates.forEach((candidates, anchor) => {
@@ -1761,7 +1755,9 @@ function flushMutationRescans(session: FullPageSession): void {
 
         // 첫 Google viewport wave는 전체 문서가 아니라 가까운 경계를 찾을 때까지만
         // 8ms slice를 이어간다. 이후에는 기존 16ms discovery cadence로 돌아간다.
-        if (shouldPrepareGoogleViewport(session)) {
+        if (isViewportCommitGroupEnabled() && session.translationMode === 'viewport' && !session.viewportCommitDiscoveryReady) {
+            nextDelay = 0;
+        } else if (shouldPrepareGoogleViewport(session)) {
             nextDelay = session.googleInitialWaveDiscoveryReady ? 16 : 0;
         }
 
@@ -1881,7 +1877,6 @@ function createFullPageSession(
         googleInitialWaveDiscoveryReady: false,
         googleInitialWaveSawVisible: false,
         viewportCommitDiscoveryReady: false,
-        viewportCommitInitialSawVisible: false,
         viewportCommitGroups: new Set(),
         viewportCommitTickets: new Map(),
         titleTranslationStarted: false,
@@ -1976,7 +1971,6 @@ export function resetFullPageTranslationRouteState(): void {
         fullPageSession.primedGoogleWaveMembers = null;
         fullPageSession.googleInitialWaveDiscoveryReady = false;
         fullPageSession.googleInitialWaveSawVisible = false;
-        fullPageSession.viewportCommitInitialSawVisible = false;
         fullPageSession.viewportCommitDiscoveryReady = false;
         fullPageSession.viewportCommitTickets.forEach(ticket => ticket.cancel());
         fullPageSession.viewportCommitGroups.forEach(group => group.dispose());

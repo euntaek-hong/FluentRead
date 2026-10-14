@@ -9862,6 +9862,44 @@ describe("悬停重挂请求与 synthetic 提交回归", () => {
         await finishScheduledWork();
         expect(candidates.map(candidate => getTranslationState(candidate)?.phase)).toEqual(['translated', 'translated', 'translated']);
     });
+    it('viewport group waits for visible article candidates after a sidebar crosses the viewport boundary', async () => {
+        runtime.viewportCommitEnabled = true;
+        runtime.config.display = 1;
+        runtime.config.maxConcurrentTranslations = 1;
+        Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1280});
+        Object.defineProperty(window, 'innerHeight', {configurable: true, value: 815});
+        document.body.innerHTML = '<aside><p id="sidebar">Further Reading</p>' +
+            Array.from({length: 40}, (_, index) => `<p data-offscreen="${index}">Offscreen sidebar ${index}.</p>`).join('') +
+            '</aside><article><p id="article">Visible article source.</p></article>';
+        const sidebar = document.querySelector<HTMLElement>('#sidebar')!;
+        const article = document.querySelector<HTMLElement>('#article')!;
+        const offscreen = Array.from(document.querySelectorAll<HTMLElement>('[data-offscreen]'));
+        [sidebar, article, ...offscreen].forEach(node => setLayoutBox(node, 600, 60));
+        setViewportRect(sidebar, 600, 60);setViewportRect(article, 100, 60);
+        offscreen.forEach(node => setViewportRect(node, 100_000, 60));
+        runtime.candidates = [sidebar, ...offscreen, article].map(element => ({element, kind: 'content' as const, reason: 'sidebar-before-article'}));
+        const responses = new Map([[sidebar.textContent!, deferred<string[]>()], [article.textContent!, deferred<string[]>()]]);
+        runtime.requests.mockImplementation(origins => responses.get(origins[0]!)!.promise);
+        let tick = 0;
+        const clock = vi.spyOn(performance, 'now').mockImplementation(() => ++tick);
+        try {
+            autoTranslateEnglishPage();
+            for (let i = 0; i < 1000 && runtime.requests.mock.calls.length < 1; i++) await vi.advanceTimersByTimeAsync(1);
+            await waitForRequestCount(1);
+            const first = runtime.requests.mock.calls[0]![0][0]!;
+            responses.get(first)!.resolve([`译:${first}`]);
+            await vi.advanceTimersByTimeAsync(5);
+            expect([sidebar, article].some(node => getTranslationState(node)?.phase === 'translated')).toBe(false);
+            for (let i = 0; i < 1000 && runtime.requests.mock.calls.length < 2; i++) await vi.advanceTimersByTimeAsync(1);
+            await waitForRequestCount(2);
+            expect([sidebar, article].some(node => getTranslationState(node)?.phase === 'translated')).toBe(false);
+            const second = runtime.requests.mock.calls[1]![0][0]!;
+            responses.get(second)!.resolve([`译:${second}`]);
+            await finishScheduledWork();
+            expect([sidebar, article].map(node => getTranslationState(node)?.phase)).toEqual(['translated', 'translated']);
+            expect(offscreen.every(node => getTranslationState(node) === undefined)).toBe(true);
+        } finally {clock.mockRestore();}
+    });
     async function stagedViewportPair() {
         runtime.viewportCommitEnabled = true;
         runtime.config.display = 1;

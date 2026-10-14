@@ -97,6 +97,7 @@ npx --yes pnpm@9.12.1 compile
 - 원본 trace와 실행 환경은 `C:/Users/ifiha/zelley/free/research/translation-performance`에 보관합니다. coverage를 켠 실행의 시간은 속도 비교에 사용하지 않습니다. 측정 중에는 빌드나 테스트를 동시에 실행하지 않습니다.
 - 일반 기사에서 baseline, 화면 일괄 전환, 요청 예산 증가, 둘의 조합을 구분해 비교합니다. 일부 문단이 먼저 보이는 프레임이 없는지 검사합니다. 캐시 없는 경우와 캐시 있는 경우를 나눠 기록합니다. 100만 자라는 문서 길이는 목표나 배포 기준으로 사용하지 않습니다.
 - 업스트림에서는 구현 형태보다 동작으로 패치 필요성을 확인합니다. cap1/group3 완료와 staged 취소를 확인합니다. 스크롤 이탈 후 재진입, 원문 변경, SPA 전환도 확인합니다. 반복 IO admission이 이미 도착한 결과를 버리면 안 됩니다. 한 요청이 실패해도 성공한 문단은 반영하고 실패한 문단의 재시도 상태는 유지해야 합니다.
+- 초기 화면 그룹은 DOM 순서가 화면의 위에서 아래로 이어진다고 가정하지 않습니다. 화면 아래 후보 하나를 발견했다고 그룹을 확정하면 안 됩니다. 사이드바가 DOM에서 먼저 나오고 본문이 나중에 나오는 경우에도 현재 화면의 대상은 같은 그룹이어야 합니다. `fullPageVisibilityScheduling.test.ts`의 `sidebar crosses` 회귀와 별도 Firefox 다열 fixture로 검사합니다. 발견은 기존 8ms slice로 나누고, 화면 밖 문단의 요청과 번역용 DOM은 계속 지연합니다.
 - 공유 코드 변경을 배포하기 전에 Chrome, Firefox, userscript를 빌드합니다. `verify:extension-manifests`와 `scripts/verify-userscript-build.mjs`도 실행합니다. Firefox 개인 버전만 올리며 원본 package 버전과 lockfile은 유지합니다.
 
 ### 개인 서명과 설치
