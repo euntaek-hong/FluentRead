@@ -109,6 +109,28 @@ npx --yes pnpm@9.12.1 compile
 - 초기 화면 그룹은 DOM 순서가 화면의 위에서 아래로 이어진다고 가정하지 않습니다. 화면 아래 후보 하나를 발견했다고 그룹을 확정하면 안 됩니다. 사이드바가 DOM에서 먼저 나오고 본문이 나중에 나오는 경우에도 현재 화면의 대상은 같은 그룹이어야 합니다. `fullPageVisibilityScheduling.test.ts`의 `sidebar crosses` 회귀와 별도 Firefox 다열 fixture로 검사합니다. 발견은 기존 8ms slice로 나누고, 화면 밖 문단의 요청과 번역용 DOM은 계속 지연합니다.
 - 공유 코드 변경을 배포하기 전에 Chrome, Firefox, userscript를 빌드합니다. `verify:extension-manifests`와 `scripts/verify-userscript-build.mjs`도 실행합니다. Firefox 개인 버전만 올리며 원본 package 버전과 lockfile은 유지합니다.
 
+### 1.0.6 성능 패치 점검
+
+- 동기 read-only 구간의 DOM 검사만 재사용합니다. generator가 양보하거나 DOM을 쓰기 전에 캐시를 닫습니다. 준비한 원문 proof는 Text identity/value 추출만 줄입니다. admission의 현재 후보 검사와 commit 직전의 원문/보호 경계/SPA 검사는 생략하지 않습니다.
+- Google native 응답의 독립 cache entry를 `setMany`의 한 transaction으로 저장합니다. clear generation, LRU prune, 실패와 겹친 pending ownership을 유지합니다. bulk API가 없는 cache port는 기존 단건 경로를 사용합니다.
+- 초기 discovery의 slice가 끝나면 발견된 화면 문단을 최대 32 slots/10,000 escaped characters까지 먼저 준비합니다. 초기 화면 그룹 확정과 일괄 commit은 계속 전체 discovery 이후에 수행합니다. 공유 요청은 마지막 소유자가 취소할 때만 중단합니다. 기존 준비 상한과 주변 prefetch 분리를 유지합니다.
+- 상단/사이드바 누락 검사는 아래 번역 탐색 범위 절차로 수행합니다. 속도 측정에서 번역 대상 누락을 성능 개선으로 계산하지 않습니다. 애니메이션과 일괄 화면 전환은 유지합니다.
+- 업데이트 회귀에는 `initialGooglePrefix.test.ts`, `translationCache.test.ts`, `translationBroker.test.ts`, `translationCore.test.ts`, `liveTextRender.test.ts`, `fullPageVisibilityScheduling.test.ts`를 포함합니다. prime 직후 `translate=no`가 생긴 후보는 loading state에도 진입하면 안 됩니다.
+
+```bash
+npx --yes pnpm@9.12.1 test -- tests/initialGooglePrefix.test.ts tests/translationCache.test.ts tests/translationBroker.test.ts tests/translationCore.test.ts tests/liveTextRender.test.ts tests/fullPageVisibilityScheduling.test.ts tests/allNodesTranslationCore.test.ts tests/personalPerformancePreset.test.ts tests/personalPerformanceRuntime.test.ts
+npx --yes pnpm@9.12.1 test:audit
+npx --yes pnpm@9.12.1 firefox:check
+```
+
+### 개인판 번역 탐색 범위 점검
+
+- `fullPageTranslationMode='viewport'`는 요청 시점을 제한합니다. `translationScope='all'`은 상단 메뉴와 사이드바를 포함할지 결정합니다. 두 설정을 같은 의미로 취급하지 않습니다.
+- 개인 ID에서 `personalTranslationCoverageV1`을 사용해 기존 `content` 범위를 한 번 `all`로 전환합니다. `personalPerformancePresetV1`의 완료 여부와 독립적으로 실행합니다. 이후 사용자가 범위를 변경하면 다시 덮어쓰지 않습니다. 업스트림 공개 패키지의 기본값은 변경하지 않습니다.
+- WSJ의 `content` 범위는 기본 structural guard와 article adapter가 navigation/complementary sidebar를 제외합니다. 사이드바 옵션만 켜는 것으로 해결됐다고 판정하지 않습니다. `all` 범위에서 기존 adapter 제외를 우회하는지 검사합니다. 입력 값과 코드, 숨겨진 텍스트, `translate=no`와 확장 UI의 보호는 유지합니다.
+- 업스트림 업데이트 후 `allNodesTranslationCore.test.ts`, `personalPerformancePreset.test.ts`, `personalPerformanceRuntime.test.ts`를 실행합니다. WSJ 상단 링크와 sidebar 제목/링크를 검사합니다. 활성화 이후 추가되는 sidebar도 같은 세션 범위로 발견해야 합니다.
+- 브라우저 회귀는 별도 Win32 desktop의 프로젝트 Playwright에서 실행합니다. `v106`의 `wsj-coverage` fixture는 `www.wsj.com`을 private profile 안에서 로컬 페이지로 연결합니다. 정적 원문 13개와 동적 원문 3개의 실제 반영을 검사합니다. 일반 기사/다열 성능 판정과 이 누락 검사를 구분합니다.
+
 ### 개인 서명과 설치
 
 - 개인 ID는 `fluent-read@euntaek-hong`, 이름은 `FluentRead Personal`입니다. 원본 Firefox manifest는 유지하고 서명용 staging 복사본만 변경합니다. 개인 버전은 `1.0.1`부터 단조 증가합니다. 업스트림 package 버전은 수정하지 않습니다.
