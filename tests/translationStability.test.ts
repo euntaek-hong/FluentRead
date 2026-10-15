@@ -1,6 +1,7 @@
 import {collectLiveTranslationTextSlots, extractTranslationText, getCurrentTranslationCore} from '@/src/core/translation/public';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {parseHTML} from 'linkedom';
+import {capturePreparedTextSource, readPreparedTextSource} from '@/src/features/full-page-translation/content/preparedTextSource';
 import {
     canKeepTranslationAttempt,
     getCurrentTranslationStateSourceSnapshot,
@@ -64,15 +65,84 @@ function childListRecord(
     } as MutationRecord;
 }
 
+describe('prepared direct text input proof', () => {
+    it('reuses only the exact connected source node and normalized input', () => {
+        const {document} = parseHTML('<html><body><p> Simple  source. </p></body></html>');
+        const owner = document.querySelector<HTMLElement>('p')!;
+        const candidate = {element:owner,kind:'content' as const,reason:'prepared',scope:'all' as const};
+        const proof = capturePreparedTextSource(candidate,'Simple source.');
+        expect(readPreparedTextSource(candidate,proof)).toEqual({source:'Simple source.',language:'Simple source.'});
+        expect(readPreparedTextSource({...candidate},proof)).toBeUndefined();
+        expect(capturePreparedTextSource(candidate,'Wrong input')).toBeUndefined();
+        const source = owner.firstChild as Text;
+        source.data = 'Changed source.';
+        expect(readPreparedTextSource(candidate,proof)).toBeUndefined();
+        source.data = ' Simple  source. ';
+        owner.replaceChild(document.createTextNode(source.data),source);
+        expect(readPreparedTextSource(candidate,proof)).toBeUndefined();
+        const fresh = capturePreparedTextSource(candidate,'Simple source.');
+        owner.remove();
+        expect(readPreparedTextSource(candidate,fresh)).toBeUndefined();
+        expect(readPreparedTextSource(candidate,undefined)).toBeUndefined();
+    });
+    it.each(['<p>Line\nbreak</p>','<p>Inline <em>source</em></p>','<div>Inline <em>source</em></div>'])('leaves complex sources on the complete validation path: %s', html => {
+        const {document} = parseHTML(`<html><body>${html}</body></html>`);
+        expect(capturePreparedTextSource({element:document.body.firstElementChild as HTMLElement,
+            kind:'content',reason:'complex'},'Simple source.')).toBeUndefined();
+    });
+    it.each(['h1','h2','div','span','a','button','p'])('proves independent direct %s input for both render kinds', tag => {
+        const {document} = parseHTML(`<html><body><${tag}> Simple  source. </${tag}></body></html>`);
+        const element = document.body.firstElementChild as HTMLElement;
+        for (const kind of ['content','control'] as const) {
+            const candidate = {element,kind,reason:'direct',scope:'all' as const};
+            const source = extractTranslationText(element,getCurrentTranslationCore('all').shouldStayOriginal);
+            expect(source).toBe('Simple source.');
+            expect(extractTranslationText(element,getCurrentTranslationCore('all').shouldStayOriginal,
+                undefined,{includeInlineCodeForLanguage:true})).toBe(source);
+            const proof = capturePreparedTextSource(candidate,source);
+            expect(readPreparedTextSource(candidate,proof)).toEqual({source,language:source});
+            candidate.kind = kind === 'content' ? 'control' : 'content';
+            expect(readPreparedTextSource(candidate,proof)).toBeUndefined();
+        }
+    });
+    it('does not prove empty, code, tooltip, shadow, value controls, or selected ranges', () => {
+        const {document} = parseHTML('<html><body><p>Simple source.</p></body></html>');
+        const element = document.querySelector<HTMLElement>('p')!;
+        const candidate = {element,kind:'content' as const,reason:'base'};
+        for (const changed of [{...candidate,sourceLine:true},{...candidate,manualChunk:true},
+            {...candidate,nodes:[element.firstChild!]},{...candidate,allowTopLevelApplicationShell:true}]) {
+            expect(capturePreparedTextSource(changed,'Simple source.')).toBeUndefined();
+        }
+        const proof = capturePreparedTextSource(candidate,'Simple source.');
+        Object.assign(candidate,{scope:'all'});
+        expect(readPreparedTextSource(candidate,proof)).toBeUndefined();
+        element.setAttribute('role','tooltip');
+        expect(capturePreparedTextSource({...candidate},'Simple source.')).toBeUndefined();
+        element.removeAttribute('role');
+        element.classList.add('tooltip');
+        expect(capturePreparedTextSource({...candidate},'Simple source.')).toBeUndefined();
+        element.classList.remove('tooltip');
+        element.attachShadow({mode:'open'});
+        expect(capturePreparedTextSource({...candidate},'Simple source.')).toBeUndefined();
+        for (const html of ['<code>API</code>','<code><span>API</span></code>','<input type="button" value="Translate">','<p> </p>']) {
+            const {document} = parseHTML(`<html><body>${html}</body></html>`);
+            const element = document.querySelector<HTMLElement>('span,p,input') ?? document.querySelector<HTMLElement>('code')!;
+            const source = extractTranslationText(element,getCurrentTranslationCore('all').shouldStayOriginal);
+            expect(source === '' || html.startsWith('<input')).toBe(true);
+            expect(capturePreparedTextSource({element,kind:'control',reason:'excluded'},source)).toBeUndefined();
+        }
+    });
+});
+
 describe('动态翻译稳定性判定', () => {
-    it('单个直接文本重挂时只遍历一次，并同时取得规范化原文与精确槽身份', () => {
+    it('单个直接文本重挂无需 TreeWalker，同时取得规范化原文与精确槽身份', () => {
         const {document} = parseHTML('<html><body><p>  Read\n the source.  </p></body></html>');
         const owner = document.querySelector<HTMLElement>('p')!;
         const walk = vi.spyOn(document, 'createTreeWalker');
         expect(getCurrentTranslationStateSourceSnapshot(owner, state())).toEqual({
             sourceText: 'Read the source.', sourceTextNodes: [owner.firstChild],
         });
-        expect(walk).toHaveBeenCalledOnce();
+        expect(walk).not.toHaveBeenCalled();
     });
 
     it.each([
@@ -1082,6 +1152,50 @@ describe('observer epoch 的真实 owner/state 与独立只读边界', () => {
 
 
 describe('仅译文合成段原文搬移回归', () => {
+    it('does not traverse an exact owner/slot/source chain, but rejects newly added source and changed identity', () => {
+        const {document} = parseHTML('<html><body><p>Readable source</p></body></html>');
+        const owner = document.querySelector<HTMLElement>('p')!;
+        const source = owner.firstChild as Text;
+        const host = document.createElement('span');
+        host.className = 'fluent-read-single-slot';
+        host.setAttribute('data-fr-translation-owned', 'true');
+        host.setAttribute('translate', 'no');
+        owner.append(host);
+        host.append(source);
+        const current = state({mode: 'single', phase: 'translated', scope: 'all',
+            sourceText: source.data, sourceTextNodes: [source],
+            singleTextSlotHosts: [{host, source, sourceValue: source.data}]});
+        const walk = vi.spyOn(document, 'createTreeWalker');
+        expect(statefulSourceAndTextSlotsAreCurrent(owner, current)).toBe(true);
+        expect(walk).not.toHaveBeenCalled();
+        owner.append(document.createTextNode(' Newly added source.'));
+        expect(statefulSourceAndTextSlotsAreCurrent(owner, current)).toBe(false);
+        owner.lastChild!.remove();
+        source.data = 'Changed source';
+        expect(statefulSourceAndTextSlotsAreCurrent(owner, current)).toBe(false);
+        source.data = current.sourceText;
+        source.replaceWith(document.createTextNode(source.data));
+        expect(statefulSourceAndTextSlotsAreCurrent(owner, current)).toBe(false);
+    });
+    it('自有槽复验复用刚检查过的宿主祖先，下一次检查仍读取新的保护标记', () => {
+        const {document} = parseHTML('<html><body><p>Readable source</p></body></html>');
+        const owner = document.querySelector<HTMLElement>('p')!;
+        const source = owner.firstChild as Text;
+        const host = document.createElement('span');
+        host.className = 'fluent-read-single-slot';
+        host.setAttribute('data-fr-translation-owned', 'true');
+        host.setAttribute('translate', 'no');
+        owner.append(host);
+        host.append(source);
+        const current = state({mode: 'single', phase: 'translated', scope: 'all',
+            sourceText: source.data, sourceTextNodes: [source],
+            singleTextSlotHosts: [{host, source, sourceValue: source.data}]});
+        const stayOriginal = vi.spyOn(getCurrentTranslationCore('all'), 'shouldStayOriginal');
+        expect(statefulSourceAndTextSlotsAreCurrent(owner, current)).toBe(true);
+        expect(stayOriginal.mock.calls.filter(([element]) => element === owner)).toHaveLength(1);
+        owner.setAttribute('translate', 'no');
+        expect(statefulSourceAndTextSlotsAreCurrent(owner, current)).toBe(false);
+    });
     it('Latest 原父移除与槽内加入均属于自身操作，真实内容变动仍需重译', () => {
         const {document} = parseHTML('<html><body><div><span data-fr-translation-segment="true"><a href="/releases/latest"><span class="Label">Latest</span></a></span></div></body></html>');
         const owner = document.querySelector<HTMLElement>('[data-fr-translation-segment]')!;
@@ -1104,6 +1218,21 @@ describe('仅译文合成段原文搬移回归', () => {
         expect(canKeepTranslationAttempt(owner, current, () => true, () => true)).toBe(false);
         expect(isOwnSingleTextSlotMove(removal, owner, current)).toBe(true);
         expect(isOwnSingleTextSlotMove(childListRecord(host, [source]), owner, current)).toBe(true);
+        const reads = createTranslationMutationStabilityChecks();
+        const walk = vi.spyOn(document, 'createTreeWalker');
+        expect(isOwnSingleTextSlotMove(removal, owner, current, reads.sourceIsCurrent)).toBe(true);
+        const firstReadCount = walk.mock.calls.length;
+        expect(firstReadCount).toBeGreaterThan(0);
+        expect(isOwnSingleTextSlotMove(childListRecord(host, [source]), owner, current,
+            reads.sourceIsCurrent)).toBe(true);
+        expect(walk).toHaveBeenCalledTimes(firstReadCount);
+        reads.invalidate();
+        expect(isOwnSingleTextSlotMove(removal, owner, current, reads.sourceIsCurrent)).toBe(true);
+        expect(walk.mock.calls.length).toBeGreaterThan(firstReadCount);
+        reads.invalidate();
+        source.data = 'Changed';
+        expect(isOwnSingleTextSlotMove(removal, owner, current, reads.sourceIsCurrent)).toBe(false);
+        source.data = 'Latest';
         const replacement = document.createTextNode('Latest');
         expect(isOwnSingleTextSlotMove(childListRecord(label, [], [replacement]), owner, current)).toBe(false);
         expect(isOwnSingleTextSlotMove(childListRecord(label, [replacement], [source]), owner, current)).toBe(false);

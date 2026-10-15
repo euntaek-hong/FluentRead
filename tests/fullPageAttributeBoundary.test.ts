@@ -59,6 +59,11 @@ vi.mock('@/src/features/full-page-translation/content/titleTranslation', () => (
     isFullPageTitleTranslationActive: () => false,
 }));
 vi.mock('@/src/features/page-notice/public', () => ({showPageNotice: () => undefined}));
+// These legacy all/hover fixtures explicitly test the deferred/immediate spinner lifecycle.
+// The personal atomic preset suppresses these indicators; viewport regressions cover that mode.
+vi.mock('@/src/features/full-page-translation/content/viewportCommitExperiment', () => ({
+    isViewportCommitGroupEnabled: () => false,
+}));
 vi.mock('@/src/core/config/customOpenAI', () => ({getCustomOpenAIProviderLabel: () => 'Fixture provider'}));
 
 import {autoTranslateEnglishPage, handleBilingualTranslation, restoreOriginalContent} from '@/src/features/full-page-translation/content/runtime';

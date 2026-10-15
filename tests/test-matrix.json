@@ -676,6 +676,7 @@
       "tests/fullPageTitleTranslation.test.ts",
       "tests/featureVerticalSliceRegression.test.ts",
       "tests/fullPageVisibilityScheduling.test.ts",
+      "tests/initialGooglePrefix.test.ts",
       "tests/viewportCommitGroup.test.ts",
       "tests/viewportPendingMotion.test.ts",
       "tests/fullPageTranslationConfigSnapshot.test.ts",

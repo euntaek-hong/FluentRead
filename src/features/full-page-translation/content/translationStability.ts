@@ -13,6 +13,7 @@ import {
     extractTranslationText,
     getComposedParent,
     getCurrentTranslationCore,
+    withTranslationDOMReadBatch,
     getTranslationCandidateKey,
     isProtectedDescendantElement,
     isTranslationTextElementProtected,
@@ -263,7 +264,8 @@ export function createTranslationMutationStabilityChecks() {
         scopeIsCurrent: (owner: HTMLElement, state: TranslationState) =>
             read(owner, state, 'scope', isTranslationStateCandidateCurrent),
         sourceIsCurrent: (owner: HTMLElement, state: TranslationState) =>
-            read(owner, state, 'source', statefulSourceAndTextSlotsAreCurrent),
+            read(owner, state, 'source', (owner, state) =>
+                withTranslationDOMReadBatch(() => statefulSourceAndTextSlotsAreCurrent(owner, state))),
         invalidate: () => {reads = new WeakMap();},
     };
 }
@@ -394,10 +396,16 @@ export function statefulSourceAndTextSlotsAreCurrent(
             !isTranslationTextElementProtected(host.parentElement, core.shouldStayOriginal, protectionCache, options))) {
             return false;
         }
+        // 精确的 owner -> 唯一槽 -> 唯一原 Text 已逐项复验身份、值和宿主保护。
+        // 没有其他 light/shadow 子树时，不可能再发现一个新增原文，省去 TreeWalker。
+        if (previousNodes.length === 1 && !node.shadowRoot && node.childNodes.length === 1) {
+            const {host, source} = state.singleTextSlotHosts[0]!;
+            if (node.firstChild === host && host.childNodes.length === 1 && host.firstChild === source) return true;
+        }
         // 已有槽保留原 Text，但新的正文可能通过 childList 或可见性变化加入。
         // collector 跳过已渲染槽，只需拒绝任何不属于本代的新增可译 Text。
         const originalNodes = new Set(previousNodes);
-        return getCurrentTranslationStateTextNodes(node, state).every((text) => originalNodes.has(text));
+        return getCurrentTranslationStateTextNodes(node, state, protectionCache).every((text) => originalNodes.has(text));
     }
 
     const currentNodes = getCurrentTranslationStateTextNodes(node, state);
@@ -436,6 +444,7 @@ export function isOwnSingleTextSlotMove(
     mutation: MutationRecord,
     target: HTMLElement,
     state: TranslationState,
+    sourceIsCurrent = statefulSourceAndTextSlotsAreCurrent,
 ): boolean {
     if (mutation.type !== 'childList' || !state.singleTextSlotHosts?.length ||
         mutation.target.nodeType !== 1) return false;
@@ -447,7 +456,7 @@ export function isOwnSingleTextSlotMove(
         (host.parentNode === mutation.target && mutation.addedNodes.length === 0 &&
             mutation.removedNodes.length === 1 && mutation.removedNodes[0] === source));
     return Boolean(slot && changedNodes.every((node) => node === slot.source) &&
-        statefulSourceAndTextSlotsAreCurrent(target, state));
+        sourceIsCurrent(target, state));
 }
 
 export function isOwnCurrentArtifactAddition(

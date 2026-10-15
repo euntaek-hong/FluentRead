@@ -2,7 +2,7 @@
  * @file src/features/full-page-translation/content/runtime.ts
  * 文件职责：实现全文翻译的页面级会话引擎，负责候选发现、可见性调度、Google viewport 无 DOM 预准备、当前与周边的独立 prime、同步等待动画和原子提交、动态 DOM 重扫、失败重试、缓存复用和恢复原文。
  * 主要内容：精确相同译文和有同目标语言证据的排版回显保留原文且不重复展示；以增量计数发布完成与失败摘要，仅对本会话失败目标重试和定位；维护 FullPageSession、AbortController、Intersection/Mutation 观察器、弹窗优先调度、精确属性写入过滤、候选所有权和生命周期重试；对变化来源等待安静窗口、跳过持续变化的计数，并清理延迟重扫，只有真实宿主删除启动候选回收，同批重复属性变化只处理一次；按时间片派发并在全文结果提交前让出主线程，合并同段 DOM 写入并在重挂时复用同批布局读数与单文本来源快照；Google viewport 仅从既有 IO pending 计划预准备有界请求，不创建 wrapper、spinner 或翻译状态；合成行内段在延迟 loading 前后都按精确来源节点、HTML 和 Text 槽识别自身迁移；已拥有状态的发现候选直接登记复验，取消记录命中后才提取原文，避免整批重扫重复计算熔断签名；连续滚动时限频派发当前可见候选，空闲后恢复预取，按阅读进度撤回离开预取区的待派发候选，冻结请求/展示配置与识别范围，在弹窗关闭后继续正文，按实际节点阶段发布进度及工具栏结果；悬浮按候选停留而非每次移动计时，同段复用冻结的独立服务与快捷方案配置，到期复验最新命中并在路由切换取消；同目标预检单独读取受保护规则约束的行内代码语言上下文，发送与渲染仍只使用可翻译文本槽；恢复单个所有者或全文时重置篇章证据，统一恢复原文并清理重挂预算及孤儿产物；向局部翻译开放单候选 translateTarget 与单个译文所有者的恢复入口。
- * 性能约束：初始原子组只提取一次入队来源，复用同次同步派发的活槽；当前固定组优先结算，附近预取随后恢复，组成员的布局移动和后台公平性不能阻塞结算。
+ * 性能约束：初始原子组只提取一次入队来源，复用同次同步派发的活槽；当前固定组优先结算，附近预取随后恢复，组成员的布局移动和后台公平性不能阻塞结算；单译文的 staging 只验会话与 attempt 身份，实际提交仍重新检查原文、保护边界和 Text 槽。同一同步只读准备或校验可复用显示检查，但 sibling DOM 写入后不能复用。
  * 模块边界：这是 content 侧编排层，不实现 provider 协议、纯候选算法或底层状态存储；翻译调用经 app client，发现规则来自 core/translation，渲染与状态分别交给 renderer、liveTextRender 和 state。
  */
 import {createFullPageMutationRuntime} from './mutationRuntime';
@@ -17,7 +17,7 @@ import {insertFailedTip} from '@/src/features/full-page-translation/ui/translati
 import {scheduleTranslationLoadingIndicator} from './loadingIndicator';
 import {syncModalTranslationHint} from '../ui/modalProgressHint';
 import {styles} from "@/src/core/config/constants";
-import {extractTranslationText, extractTranslationTextFromNodes, applyTranslationsToSnapshot, collectLiveTranslationTextSlots, createTranslationSourceSnapshot, getComposedParent, getCurrentTranslationCore, getOpenShadowRoots, getTranslationCandidateKey, resolveTranslationCandidateAtPoint, selectPreferredTranslationCandidate} from "@/src/core/translation/public";
+import {extractTranslationText, extractTranslationTextFromNodes, applyTranslationsToSnapshot, collectLiveTranslationTextSlots, collectLiveTranslationTextSlotsFromNodes, createTranslationSourceSnapshot, getComposedParent, getCurrentTranslationCore, getOpenShadowRoots, getTranslationCandidateKey, resolveTranslationCandidateAtPoint, selectPreferredTranslationCandidate, withTranslationDOMReadBatch} from "@/src/core/translation/public";
 import type {TranslationCandidate, TranslationScope} from "@/src/core/translation/public";
 import {shouldSkipTranslationForTarget} from '@/src/core/language/detect';
 import {services} from '@/src/core/config/catalog';
@@ -49,6 +49,8 @@ import {bindFullPageRequestSessionAttempt, createFullPageRequestSessionState, di
 import {resetFullPageRouteSession} from './routeLifecycle';
 import {HoverTranslationScheduler, type HoverTranslationInvocation} from './hoverScheduler';
 import {personalCorrectionIsCurrent, registerPersonalCorrectionResult} from './personalCorrections';
+import {capturePreparedTextSource, plainDirectText, readPreparedTextSource} from './preparedTextSource';
+import {readDiscoveryStep} from './discoveryReadStep';
 
 import {isElementNode, asHTMLElement, createTranslationMutationObserverOptions, mutationRootContains as nodeContains, collapseMutationRescanRoot as broadRescanRoot} from './mutationObservation';
 import {isWithinTranslationModal} from './modalPriority';
@@ -56,6 +58,7 @@ import {refreshModalSession} from './modalSession';
 
 import {createViewportCommitGroup, type ViewportCommitGroup} from './viewportCommitGroup';
 import {isViewportCommitGroupEnabled} from './viewportCommitExperiment';
+import {createInitialGooglePrefix} from './initialGooglePrefix';
 import {createViewportPendingMotion} from './viewportPendingMotion';
 
 const translationSourceStability = new TranslationSourceStabilityGate<FullPageSession>({
@@ -69,6 +72,12 @@ const FULL_PAGE_LIFECYCLE_RETRY_LIMIT = 2;
 // 同时准备至多四个独立 native 批次，provider 仍按 32 槽/10k 分包。
 const FULL_PAGE_PREPARE_MAX_TEXT_SLOTS = 128;
 const FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS = 40_000;
+const initialGooglePrefix = createInitialGooglePrefix({
+    eligible: session => session.active && isViewportCommitGroupEnabled() && shouldPrepareGoogleViewport(session)
+        && session.translationConfig.displayMode === 'single' && getCurrentTranslationCore(session.scope).adapters.length === 0,
+    visible: isAnchorVisible, prepare: prepareGoogleCandidate, cancel: cancelPreparedCandidate, release: releasePreparedCandidate,
+    prime: (session, origins, signal) => primeNativeGooglePageSlots(origins, session.translationConfig, session, signal),
+});
 const GOOGLE_HTML_WRAPPER_CHARACTERS = 11;
 
 const hoverTranslationScheduler = new HoverTranslationScheduler({
@@ -164,6 +173,13 @@ function candidateSourceText(
         candidate.manualChunk ? candidate.element : undefined,
         protectionOptions,
     );
+}
+/** 单一 Text 的普通叶子没有内联/代码边界；换行与复杂结构仍独立读取语言上下文。 */
+function candidateLanguageText(candidate: TranslationCandidate, source: string,
+    core: ReturnType<typeof getCurrentTranslationCore>,
+    options: ReturnType<typeof getCandidateTranslationTextProtectionOptions>): string {
+    if (plainDirectText(candidate)) return source;
+    return candidateSourceText(candidate, core, {...options, includeInlineCodeForLanguage: true});
 }
 function translateNode(
     node: unknown,
@@ -396,20 +412,20 @@ async function prepareViewportCommit(
     const stableOwner = owner;
     const stale = (): TranslationTargetOutcome => ({status: 'stale', retryRoot: discardStaleAttempt(node, state), attemptNode: node});
     const cancel = (): void => { if (getTranslationState(node) === state) discardStaleAttempt(node, state); };
-    const isBaseCurrent = (): boolean => state.controller.signal.aborted === false &&
+    const isAttemptCurrent = (): boolean => state.controller.signal.aborted === false &&
         getTranslationState(node) === state && stableOwner?.active === true && fullPageSession === stableOwner &&
-        (requestSession.renderCommitGeneration ?? 0) === requestCommitGeneration && node.isConnected &&
-        attemptSourceIsCurrent(node, state) && (Boolean(candidate.nodes?.length) || candidateIsCurrent(candidate));
+        (requestSession.renderCommitGeneration ?? 0) === requestCommitGeneration && node.isConnected;
+    const isBaseCurrent = (): boolean => withTranslationDOMReadBatch(() => isAttemptCurrent() &&
+        attemptSourceIsCurrent(node, state) && (Boolean(candidate.nodes?.length) || candidateIsCurrent(candidate)));
     if (import.meta.env.BROWSER !== 'userscript' && !await personalCorrectionIsCurrent(result.personalCorrection, node)) {
         return {isCurrent: () => false, commit: stale, cancel};
     }
-    if (!isBaseCurrent()) return {isCurrent: () => false, commit: stale, cancel};
+    if (!isAttemptCurrent()) return {isCurrent: () => false, commit: stale, cancel};
     if (result.kind === 'control-value' || result.kind === 'live-text') {
         return {
-            isCurrent: isBaseCurrent,
+            isCurrent: isAttemptCurrent,
             commit: () => {
-                if (!isBaseCurrent()) return stale();
-                const committed = renderLiveTextResult(node, state, generation, result, candidate.scope, snapshot.targetLanguage);
+                const committed = renderLiveTextResult(node, state, generation, result, candidate.scope, snapshot.targetLanguage, isBaseCurrent);
                 if (committed === 'committed') return {status: 'committed'};
                 if (committed === 'unchanged') return {status: 'unchanged', source: state.sourceText, attemptNode: node};
                 return committed === 'stale' ? stale() : {status: 'empty', retryRoot: node.isConnected ? node : undefined, attemptNode: node};
@@ -417,6 +433,7 @@ async function prepareViewportCommit(
             cancel,
         };
     }
+    if (!isBaseCurrent()) return {isCurrent: () => false, commit: stale, cancel};
     if (result.sources.length === 0 || result.translations.length !== result.sources.length) {
         return {
             isCurrent: isBaseCurrent,
@@ -746,8 +763,7 @@ function canPrepareGoogleCandidate(session: FullPageSession, candidate: Translat
         && session.translationMode === 'viewport'
         && session.translationConfig.service === services.google
         && session.translationConfig.enableNativeBatch !== false
-        && candidate.kind === 'content'
-        && !candidate.nodes?.length
+        && (!candidate.nodes?.length || session.translationConfig.displayMode === 'single')
         && !candidate.visualRange
         && !candidate.manualChunk
         && candidate.element.isConnected
@@ -765,43 +781,49 @@ function prepareGoogleCandidate(session: FullPageSession, candidate: Translation
         cancelPreparedCandidate(session, candidate);
         return;
     }
-    const core = getCurrentTranslationCore(candidate.scope);
-    const protectionOptions = getCandidateTranslationTextProtectionOptions(candidate);
-    const source = candidateSourceText(candidate, core, protectionOptions);
+    const inputs = withTranslationDOMReadBatch(() => {
+        const core = getCurrentTranslationCore(candidate.scope);
+        const protectionOptions = getCandidateTranslationTextProtectionOptions(candidate);
+        const source = candidateSourceText(candidate, core, protectionOptions);
+        if (!normalizeComparableText(source)) return;
+        // 自动入口门槛与槽收集仅做读取；取消旧准备放在缓存作用域之外。
+        if (translationSourceStability.blocks(candidate, source, session)) return;
+        if (session.translationConfig.displayMode === 'bilingual' && blocksBilingualRemountCandidate(
+            session.bilingualRemountCapitulations,
+            candidate.element,
+            source,
+            candidate.allowTopLevelApplicationShell === true,
+            getTranslationInvocationIdentity(session.translationConfig),
+            candidate.nodes,
+            candidate.scope,
+        )) return;
+        if (shouldSkipTranslationForTarget(
+            candidateLanguageText(candidate, source, core, protectionOptions),
+            session.translationConfig.targetLanguage,
+            session.translationConfig.excludedLanguages,
+        )) return;
+        const slots = candidate.nodes?.length
+            ? collectLiveTranslationTextSlotsFromNodes(candidate.element, candidate.nodes, core.shouldStayOriginal, protectionOptions)
+            : collectLiveTranslationTextSlots(candidate.element, core.shouldStayOriginal, undefined, protectionOptions);
+        if (slots.length === 0) return;
+        const origins = slots.map(slot => slot.source);
+        if (!canPrimeNativeGoogleSlots(origins, session.translationConfig)) return;
+        return {source, origins, slotCount: slots.length,
+            escapedCharacters: slots.reduce((total, slot) => total + googleEscapedTextLength(slot.source), 0)};
+    });
+    if (!inputs) return;
+    const {source, origins, slotCount, escapedCharacters} = inputs;
     const existing = session.preparedCandidates.get(key);
-    if (!normalizeComparableText(source)) return;
-    // translateTarget와 같은 자동 진입 문턱을 DOM 생성 전에 적용한다. 안정화 gate는
-    // 대기 timer를 등록할 수 있지만 provider, spinner, wrapper 또는 상태를 만들지 않는다.
-    if (translationSourceStability.blocks(candidate, source, session)) return;
-    if (session.translationConfig.displayMode === 'bilingual' && blocksBilingualRemountCandidate(
-        session.bilingualRemountCapitulations,
-        candidate.element,
-        source,
-        candidate.allowTopLevelApplicationShell === true,
-        getTranslationInvocationIdentity(session.translationConfig),
-        candidate.nodes,
-        candidate.scope,
-    )) return;
-    if (shouldSkipTranslationForTarget(
-        candidateSourceText(candidate, core, {...protectionOptions, includeInlineCodeForLanguage: true}),
-        session.translationConfig.targetLanguage,
-        session.translationConfig.excludedLanguages,
-    )) return;
-    const slots = collectLiveTranslationTextSlots(candidate.element, core.shouldStayOriginal, undefined, protectionOptions);
-    if (slots.length === 0) return;
-    const origins = slots.map(slot => slot.source);
-    if (!canPrimeNativeGoogleSlots(origins, session.translationConfig)) return;
     if (existing) {
         const exactSameSlots = existing.origins.length === origins.length
             && existing.origins.every((origin, index) => origin === origins[index]);
         if (existing.source === source && existing.candidate.scope === candidate.scope && exactSameSlots) {
             existing.candidate = candidate;
+            existing.admissionSource = capturePreparedTextSource(candidate, source);
             return;
         }
         cancelPreparedCandidate(session, existing.candidate);
     }
-    const slotCount = slots.length;
-    const escapedCharacters = slots.reduce((total, slot) => total + googleEscapedTextLength(slot.source), 0);
     const oversizedSingle = slotCount === 1 && escapedCharacters > FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS;
     if (!oversizedSingle && (session.preparedSlots + slotCount > FULL_PAGE_PREPARE_MAX_TEXT_SLOTS
         || session.preparedEscapedCharacters + escapedCharacters > FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS)) return;
@@ -811,6 +833,7 @@ function prepareGoogleCandidate(session: FullPageSession, candidate: Translation
     const entry: PreparedCandidate = {candidate, controller, source, slots: slotCount, escapedCharacters,
         origins,
         nativeGooglePrimeProof: {origins, invocationIdentity: getTranslationInvocationIdentity(session.translationConfig)},
+        admissionSource: capturePreparedTextSource(candidate, source),
         settled: false, consumed: false};
     session.preparedCandidates.set(key, entry);
     session.preparedSlots += slotCount;
@@ -851,12 +874,12 @@ function releaseInitialGoogleVisibleWave(session: FullPageSession): void {
 /** 多列页面按实际几何恢复初始预取队列；提交组仍只保留当前可见锚点。 */
 function releaseInitialViewportCommitGroup(session: FullPageSession): void {
     if (session.viewportCommitDiscoveryReady) return;
-    session.observedCandidates.forEach((candidates, anchor) => {
+    withTranslationDOMReadBatch(() => session.observedCandidates.forEach((candidates, anchor) => {
         if (!isAnchorNearViewport(anchor)) return;
         candidates.forEach((candidate, key) => {
             queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
         });
-    });
+    }));
     session.viewportCommitDiscoveryReady = true;
 }
 
@@ -910,17 +933,34 @@ function prepareGoogleDispatchPlan(session: FullPageSession, startedAt: number):
     const visibleFirst = !session.modal && isViewportCommitGroupEnabled() && (session.viewportCommitTickets.size > 0 ||
         plan.candidates.some(({key, candidate, priority}) => priority.band === 'visible' &&
             session.pending.get(key) === candidate && !session.inFlightCandidates.has(key)));
-    while (session.prepareCursor < plan.candidates.length && performance.now() - startedAt < 8) {
+    const prepareNext = (): boolean => {
         const selection = plan.candidates[session.prepareCursor++]!;
         if (session.pending.get(selection.key) !== selection.candidate
-            || session.inFlightCandidates.has(selection.key)) continue;
+            || session.inFlightCandidates.has(selection.key)) return false;
         // 原子画面先准备固定成员；附近独立槽在结算后的新计划继续，不占当前读取预算。
         // 已预约成员移到附近仍需完成；更远候选继续只保留观察元数据。
         if (selection.priority.band === 'background' ||
-            (visibleFirst && selection.priority.band !== 'visible' && !session.viewportCommitTickets.has(selection.key))) continue;
-        prepareGoogleCandidate(session, selection.candidate);
-        if (session.preparedSlots >= FULL_PAGE_PREPARE_MAX_TEXT_SLOTS
-            || session.preparedEscapedCharacters >= FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS) return true;
+            (visibleFirst && selection.priority.band !== 'visible' && !session.viewportCommitTickets.has(selection.key))) return false;
+        const existing = session.preparedCandidates.get(selection.key);
+        if (!existing || !initialGooglePrefix.isPrimed(existing)) prepareGoogleCandidate(session, selection.candidate);
+        return session.preparedSlots >= FULL_PAGE_PREPARE_MAX_TEXT_SLOTS
+            || session.preparedEscapedCharacters >= FULL_PAGE_PREPARE_MAX_ESCAPED_CHARACTERS;
+    };
+    while (session.prepareCursor < plan.candidates.length && performance.now() - startedAt < 8) {
+        // 旧准备的撤销可能同步调用宿主/attempt 清理，不与只读保护结果共享。
+        if (session.preparedCandidates.has(plan.candidates[session.prepareCursor]!.key)) {
+            if (prepareNext()) return true;
+            continue;
+        }
+        // 新槽仅登记 controller 和元数据；同一 8ms 同步读取阶段可复用祖先显示检查。
+        const full = withTranslationDOMReadBatch(() => {
+            do {
+                if (prepareNext()) return true;
+            } while (session.prepareCursor < plan.candidates.length && performance.now() - startedAt < 8
+                && !session.preparedCandidates.has(plan.candidates[session.prepareCursor]!.key));
+            return false;
+        });
+        if (full) return true;
     }
     if (session.prepareCursor < plan.candidates.length) return false;
     // 첫 IO callback은 discovery가 막 등록한 일부 anchor만 담을 수 있다. near-viewport
@@ -930,7 +970,7 @@ function prepareGoogleDispatchPlan(session: FullPageSession, startedAt: number):
 
 function primePreparedGoogleWave(session: FullPageSession): boolean {
     if (session.primedGoogleWave) return false;
-    const entries = [...session.preparedCandidates.values()].filter(entry => !entry.consumed && !entry.controller.signal.aborted);
+    const entries = [...session.preparedCandidates.values()].filter(entry => !entry.consumed && !entry.controller.signal.aborted && !initialGooglePrefix.isPrimed(entry));
     if (entries.length === 0) return false;
     const controller = new AbortController();
     session.requestControllers.add(controller);
@@ -1080,16 +1120,32 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
         withFullPageViewportAnchor(() => restoreTranslation(existingNode), [existingNode]);
     }
 
-    if (!candidateIsCurrent(candidate)) {
+    const core = getCurrentTranslationCore(candidate.scope);
+    const candidateProtectionOptions = getCandidateTranslationTextProtectionOptions(candidate);
+    // 候选边界、请求原文和语言上下文同属这一同步只读阶段；写入/物化之前结束缓存。
+    const preparedInput = owner?.active && !current && !forceFailedRequest
+        ? owner.preparedCandidates.get(getTranslationCandidateKey(candidate)) : undefined;
+    const inputProof = preparedInput && !preparedInput.consumed && !preparedInput.controller.signal.aborted
+        ? readPreparedTextSource(candidate, preparedInput.admissionSource) : undefined;
+    const inputs = withTranslationDOMReadBatch(() => {
+        if (!candidateIsCurrent(candidate)) return undefined;
+        if (inputProof) return {...inputProof, slots: collectLiveTranslationTextSlots(
+            candidate.element, core.shouldStayOriginal, undefined, candidateProtectionOptions)};
+        const source = candidateSourceText(candidate, core, candidateProtectionOptions);
+        return {source, language: normalizeComparableText(source)
+            ? candidateLanguageText(candidate, source, core, candidateProtectionOptions) : '',
+            slots: plainDirectText(candidate)
+                ? collectLiveTranslationTextSlots(candidate.element, core.shouldStayOriginal, undefined, candidateProtectionOptions)
+                : undefined};
+    });
+    if (!inputs) {
         return {
             status: "not-current",
             retryRoot: candidate.element.isConnected ? candidate.element : undefined,
         };
     }
 
-    const core = getCurrentTranslationCore(candidate.scope);
-    const candidateProtectionOptions = getCandidateTranslationTextProtectionOptions(candidate);
-    const sourceText = candidateSourceText(candidate, core, candidateProtectionOptions);
+    const sourceText = inputs.source;
     if (!normalizeComparableText(sourceText)) {
         return {
             status: "empty",
@@ -1111,11 +1167,13 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
     // 同语言检测只是节流优化；不确定、短 Latin 与纯 Han 必须 fail-open，
     // 否则日中混合标题或法德短文会在 provider 之前静默漏译。
     if (shouldSkipTranslationForTarget(
-            candidateSourceText(candidate, core, {...candidateProtectionOptions, includeInlineCodeForLanguage: true}),
+            inputs.language,
             translationConfig.targetLanguage, translationConfig.excludedLanguages)) {
         return {status: "unchanged", source: sourceText};
     }
+    const preparationBeforeConsume = statefulSession?.preparedCandidates.get(getTranslationCandidateKey(candidate));
     const preparedCandidate = consumePreparedCandidate(statefulSession, candidate, sourceText);
+    const reusableInputSlots = !preparationBeforeConsume || preparedCandidate === preparationBeforeConsume ? inputs.slots : undefined;
 
     if (candidate.visualRange) {
         const visualCandidate = withFullPageViewportAnchor(
@@ -1148,7 +1206,7 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
     // 捕获每个候选中可翻译 Text 节点的精确身份。renderer 可能在提交后只替换受保护的
     // MathJax/KaTeX 子节点；仅比较原文无法区分这种无害事务与同文本宿主/链接替换，
     // 后者会使已渲染快照失效。
-    const currentTextSlots = collectLiveTranslationTextSlots(
+    const currentTextSlots = reusableInputSlots && !synthetic && node === candidate.element ? reusableInputSlots : collectLiveTranslationTextSlots(
         node,
         core.shouldStayOriginal,
         synthetic ? node : undefined,
@@ -1201,9 +1259,9 @@ export async function translateTarget(candidate: TranslationCandidate, displayMo
         requestProtectionOptions,
         forceFailedRequest,
         candidate.scope,
-        preparedCandidate && !synthetic && kind === 'content'
+        preparedCandidate
             ? {...preparedCandidate.nativeGooglePrimeProof, validatedSlots: currentTextSlots}
-            : preparedCandidate?.nativeGooglePrimeProof,
+            : undefined,
     )
         .finally(() => { signal.removeEventListener('abort', cancelQueuedRequest); releaseRequestSession(); });
     if (synthetic) node.setAttribute('data-fr-translation-segment', 'true');
@@ -1734,7 +1792,6 @@ function flushMutationRescans(session: FullPageSession): void {
     if (!session.activeDiscovery) invalidateGoogleDispatchPlan(session);
     const startedAt = performance.now();
     let nextDelay = 16;
-
     while (session.activeDiscovery || session.dirtyRoots.size > 0) {
         if (!session.activeDiscovery) {
             const iterator = session.dirtyRoots.values().next();
@@ -1758,7 +1815,7 @@ function flushMutationRescans(session: FullPageSession): void {
         }
 
         const active = session.activeDiscovery;
-        const step = active.steps.next();
+        const step = readDiscoveryStep(active.steps, getCurrentTranslationCore(session.scope).adapters.length > 0);
         if (step.done) {
             if (session.broadRescanRoots.has(active.root)) {
                 session.broadRescanCooldowns.set(active.root, performance.now() + BROAD_RESCAN_COOLDOWN_MS);
@@ -1783,7 +1840,10 @@ function flushMutationRescans(session: FullPageSession): void {
                 scheduleStatefulAttributeReevaluation(session, statefulStepTarget);
             }
         }
-        if (step.value.candidate) scheduleDiscoveredCandidate(session, step.value.candidate);
+        if (step.value.candidate) {
+            scheduleDiscoveredCandidate(session, step.value.candidate);
+            if (session.scheduled.get(getTranslationCandidateKey(step.value.candidate)) === step.value.candidate) initialGooglePrefix.prepare(session, step.value.candidate);
+        }
 
         // 첫 Google viewport wave는 전체 문서가 아니라 가까운 경계를 찾을 때까지만
         // 8ms slice를 이어간다. 이후에는 기존 16ms discovery cadence로 돌아간다.
@@ -1798,6 +1858,7 @@ function flushMutationRescans(session: FullPageSession): void {
         if (performance.now() - startedAt >= 8) break;
     }
 
+    initialGooglePrefix.start(session);
     if (session.activeDiscovery || session.dirtyRoots.size > 0) {
         session.mutationFlushTimer = window.setTimeout(() => flushMutationRescans(session), nextDelay);
     } else {
@@ -1834,7 +1895,7 @@ function createFullPageSession(
             candidates.forEach((candidate, key) => {
                 if (entry.isIntersecting && (!isViewportCommitGroupEnabled() || session.translationMode !== 'viewport' || session.viewportCommitDiscoveryReady)) {
                     queueFullPageCandidate(session, key, candidate, candidateLifecycleSource(candidate));
-                } else {
+                } else if (!entry.isIntersecting) {
                     // 快速划过的内容退出预取区后继续观察，等再次进入时才派发。
                     // 已交给 DOM 的请求继续；尚未消费的预准备则撤销，立即归还 32 槽/10k 预算。
                     removeFullPagePending(session, key, candidate);

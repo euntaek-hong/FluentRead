@@ -17,6 +17,7 @@ vi.mock('@/src/core/translation/public', async (importOriginal) => {
 });
 
 import {renderLiveTextResult} from '@/src/features/full-page-translation/content/liveTextRender';
+import {collectLiveTranslationTextSlots, getCurrentTranslationCore} from '@/src/core/translation/public';
 import type {
     ControlValueTranslationResult,
     LiveTextTranslationResult,
@@ -72,6 +73,53 @@ describe('替换式译文提交', () => {
     beforeEach(() => {
         runtime.slots = null;
         vi.unstubAllGlobals();
+    });
+
+    it.each([{complete:false},{changed:false}])('keeps an obsolete empty/unchanged result from discarding a current owner: %j', overrides => {
+        const document = page('<p>Save draft</p>');
+        const node = document.body.firstElementChild as HTMLElement;
+        const original = node.firstChild as Text;
+        const attempt = beginTranslation(node, 'single', 'content', false, 'Save draft', [original])!;
+        expect(renderLiveTextResult(node, attempt.state, attempt.generation,
+            liveResult(overrides), 'all', 'zh-CN', () => false)).toBe('stale');
+        expect(getTranslationState(node)).toBe(attempt.state);
+        expect(node.firstChild).toBe(original);
+        expect(node.textContent).toBe('Save draft');
+        restoreTranslation(node);
+    });
+
+    it('shares synchronous safety reads with the final attempt check before any DOM write', () => {
+        const document = page('<button id="save">Save draft</button>');
+        const node = document.querySelector<HTMLElement>('#save')!;
+        const original = node.firstChild as Text;
+        const attempt = beginTranslation(node, 'single', 'control', false, 'Save draft', [original], false, '', 'all')!;
+        const style = vi.fn(() => ({display:'block',visibility:'visible',position:'static',overflowY:'visible',fontFamily:'Arial'}));
+        Object.defineProperty(document.defaultView!, 'getComputedStyle', {configurable:true,value:style});
+        let checkedReads = 0;
+        const check = vi.fn(() => {
+            const slots = collectLiveTranslationTextSlots(node, getCurrentTranslationCore('all').shouldStayOriginal);
+            checkedReads = style.mock.calls.length;
+            return slots.length === 1 && slots[0]!.source === 'Save draft';
+        });
+        expect(renderLiveTextResult(node, attempt.state, attempt.generation, liveResult({
+            sources:['Save draft'],translations:['保存草稿'],nodes:[original],
+        }), 'all', 'zh-CN', check)).toBe('committed');
+        expect(check).toHaveBeenCalledOnce();
+        expect(style.mock.calls).toHaveLength(checkedReads);
+        expect(node.textContent).toBe('保存草稿');
+        restoreTranslation(node);
+        expect(node.firstChild).toBe(original);
+    });
+
+    it.each(['live-text','control-value'] as const)('rejects a stale final attempt check for %s without writing', kind => {
+        const document = page(kind === 'live-text' ? '<button>Save draft</button>' : '<input type="button" value="Save draft">');
+        const node = document.body.firstElementChild as HTMLElement;
+        const original = node.firstChild as Text;
+        const attempt = beginTranslation(node, 'single', 'control', false, 'Save draft', original ? [original] : [])!;
+        const result = kind === 'live-text' ? liveResult({sources:['Save draft'],translations:['保存草稿'],nodes:[original]}) : controlValueResult();
+        expect(renderLiveTextResult(node, attempt.state, attempt.generation, result, undefined, 'zh-CN', () => false)).toBe('stale');
+        expect(kind === 'live-text' ? node.textContent : node.getAttribute('value')).toBe('Save draft');
+        expect(getTranslationState(node)?.phase).toBe('loading');
     });
 
     it('控件先完成所有样式复验，再一次性撤下 loading 和写入译文', () => {

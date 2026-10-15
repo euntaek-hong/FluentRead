@@ -14,6 +14,7 @@ import {type FullPageQueueState, type FullPageDispatchPlan} from '@/src/features
 import {type FullPageLifecycleRetry, type AcceptedUnchangedCompletion} from '@/src/features/full-page-translation/content/translationStability';
 import {type FullPageRequestSessionState} from '@/src/features/full-page-translation/content/requestSession';
 import {type ModalPrioritySession} from './modalSession';
+import type {PreparedTextSource} from './preparedTextSource';
 import {type ViewportCommitGroup} from './viewportCommitGroup';
 export type TranslationTargetOutcome =
     | {status: "committed" | "failed" | "owned" | "deferred"}
@@ -125,6 +126,7 @@ export interface PreparedCandidate {
     escapedCharacters: number;
     origins: readonly string[];
     nativeGooglePrimeProof: NativeGooglePrimeProof;
+    admissionSource?: PreparedTextSource;
     settled: boolean;
     consumed: boolean;
 }

@@ -12,6 +12,8 @@ import {DEFAULT_EAGER_TRANSLATION_CHARACTERS} from '@/src/core/config/pageTransl
 const runtime = vi.hoisted(() => ({
     realCore: null as TranslationCandidateCore | null,
     realTextExtraction: false,
+    realLiveSlots: false,
+    realTextProtection: false,
     viewportCommitEnabled: false,
     adapters: [] as TranslationSiteAdapter[],
     candidateEligible: vi.fn<(element: Element) => boolean>(() => true),
@@ -246,6 +248,7 @@ vi.mock("@/src/core/translation/public", async (importOriginal) => {
     return {
         // 属性型按钮标签的安全边界由 core 唯一定义，测试替身不复制其判定规则。
         getTranslatableControlValueAttribute: actual.getTranslatableControlValueAttribute,
+        withTranslationDOMReadBatch: actual.withTranslationDOMReadBatch,
         normalizeTranslationText: actual.normalizeTranslationText,
         createCurrentTranslationResolverBatch: () => (start: Node, scope = 'content') => runtime.realCore
             ? runtime.realCore.resolve(start) : resolveCandidate(scope)(start),
@@ -259,7 +262,9 @@ vi.mock("@/src/core/translation/public", async (importOriginal) => {
             runtime.realTextExtraction ? actual.extractTranslationTextFromNodes(...args)
                 : args[0].map((node) => node.textContent ?? "").join(""),
         applyTranslationsToSnapshot: (_snapshot: unknown, translations: readonly string[]) => translations.join(""),
-        collectLiveTranslationTextSlots: textSlots,
+        collectLiveTranslationTextSlots: (...args: Parameters<typeof actual.collectLiveTranslationTextSlots>) =>
+            runtime.realLiveSlots ? actual.collectLiveTranslationTextSlots(...args) : textSlots(args[0], args[1]),
+        collectLiveTranslationTextSlotsFromNodes: actual.collectLiveTranslationTextSlotsFromNodes,
         createTranslationTextProtectionCache: () => new WeakMap<Element, {
             depth: number;
             protected: boolean;
@@ -276,7 +281,8 @@ vi.mock("@/src/core/translation/public", async (importOriginal) => {
         getComposedParent: (element: Element) => element.parentElement ??
             ((element.getRootNode?.() as {host?: Element})?.host ?? null),
         isProtectedDescendantElement: (element: Element) => element.matches(protectedSelector),
-        isTranslationTextElementProtected: (element: Element) => isProtected(element),
+        isTranslationTextElementProtected: (...args: Parameters<typeof actual.isTranslationTextElementProtected>) =>
+            runtime.realTextProtection ? actual.isTranslationTextElementProtected(...args) : isProtected(args[0]),
         getCurrentTranslationCore: (scope = "content") => runtime.realCore ?? ({
             adapters: runtime.adapters,
             shouldStayOriginal: (element: Element) => (scope !== "all" && Boolean(element.closest("[data-content-excluded]"))) || runtime.adapters.some(adapter =>
@@ -346,7 +352,7 @@ import {
     restoreOriginalContent,
     restoreTranslationOwner,
 } from "@/src/features/full-page-translation/content/runtime";
-import {getTranslationState} from "@/src/features/full-page-translation/content/state";
+import {getTranslationState, subscribeTranslationStateChanges} from "@/src/features/full-page-translation/content/state";
 import {toggleTranslationSection} from '@/src/features/full-page-translation/content/sectionTranslation';
 import {createBilingualRemountCapitulationRegistry} from '@/src/features/full-page-translation/content/bilingualRemount';
 import {resetFullPageRouteSession, type FullPageRouteLifecycleSession} from '@/src/features/full-page-translation/content/routeLifecycle';
@@ -555,6 +561,8 @@ describe("全文翻译可见性锚点", () => {
         runtime.adapters = [];
         runtime.realCore = null;
         runtime.realTextExtraction = false;
+        runtime.realLiveSlots = false;
+        runtime.realTextProtection = false;
         runtime.viewportCommitEnabled = false;
         runtime.candidateEligible.mockReset().mockReturnValue(true);
         runtime.ignoreMutation.mockReset().mockReturnValue(false);
@@ -586,6 +594,145 @@ describe("全文翻译可见性锚点", () => {
             else Reflect.deleteProperty(globalThis, name);
         }
         replacedGlobals.clear();
+    });
+
+    it.each([
+        ['plain paragraph','Alpha  market evidence.',1,'Alpha market evidence.'],
+        ['newline paragraph','Alpha market evidence.\nSecond sentence.',2,'Alpha market evidence.\nSecond sentence.'],
+        ['inline paragraph','Alpha <em>market</em> evidence.',2,'Alpha market evidence.'],
+    ] as const)('keeps language evidence while avoiding duplicate extraction for %s', async (_name, html, reads, language) => {
+        runtime.realTextExtraction = true;
+        document.body.innerHTML = `<p>${html}</p>`;
+        const element = document.querySelector<HTMLElement>('p')!;
+        const candidate = {element,kind:'content' as const,reason:'test'};
+        runtime.candidates = [candidate];
+        const pending = translateTarget(candidate, 'single', false);
+        expect(runtime.sourceReads.mock.calls.filter(([node]) => node === element)).toHaveLength(reads);
+        expect(runtime.clearlyTargetLanguage.mock.calls[0]?.[0]).toBe(language);
+        await pending;
+    });
+
+    it('reuses the current plain paragraph slots before materialization without repeating its safety styles', async () => {
+        runtime.realTextExtraction = true;runtime.realLiveSlots = true;
+        document.body.innerHTML = '<p>Fresh simple source paragraph.</p>';
+        const element = document.querySelector<HTMLElement>('p')!;
+        runtime.realCore = new TranslationCandidateCore({url:new URL('https://example.com'),scope:'all',adapters:[]});
+        const styles = vi.fn((_element: Element) => ({display:'block',visibility:'visible',position:'static',
+            overflowY:'visible',fontFamily:'Arial'}));
+        const previous = Object.getOwnPropertyDescriptor(window,'getComputedStyle');
+        Object.defineProperty(window,'getComputedStyle',{configurable:true,value:styles});
+        try {
+            const pending = translateTarget({element,kind:'content',reason:'plain-slots',scope:'all'},'single',false);
+            const admissionReads = styles.mock.calls.filter(([node]) => node === element).length;
+            await pending;
+            // One shared admission read and the independent request fallback read.
+            expect(admissionReads).toBe(2);
+        } finally {
+            if (previous) Object.defineProperty(window,'getComputedStyle',previous);
+            else Reflect.deleteProperty(window,'getComputedStyle');
+        }
+    });
+
+    it.each([
+        {tag:'p',kind:'content' as const}, {tag:'h2',kind:'content' as const},
+        {tag:'p',kind:'control' as const}, {tag:'button',kind:'control' as const},
+    ])('uses exact prepared $tag/$kind input without reading it again during admission', async ({tag,kind}) => {
+        runtime.viewportCommitEnabled = true;runtime.nativeBatchEnabled = true;
+        runtime.config.service = 'google';runtime.config.display = 1;
+        Object.defineProperty(window,'innerWidth',{configurable:true,value:1280});
+        Object.defineProperty(window,'innerHeight',{configurable:true,value:815});
+        document.body.innerHTML = `<${tag}>Prepared first source.</${tag}><${tag}>Prepared second source.</${tag}>`;
+        const nodes = [...document.querySelectorAll<HTMLElement>(tag)];
+        nodes.forEach(node => {setLayoutBox(node,600,60);setViewportRect(node,20,60);});
+        runtime.candidates = nodes.map(element => ({element,kind,reason:'source-proof'}));
+        const response = deferred<string[]>();
+        let primed = false;
+        let admissionReads = 0;
+        runtime.requests.mockImplementation(() => {primed = true;return response.promise;});
+        runtime.sourceReads.mockImplementation(node => {if (primed && !getTranslationState(node)) admissionReads++;});
+        autoTranslateEnglishPage();await vi.advanceTimersByTimeAsync(30);
+        const reads = admissionReads;
+        response.resolve(nodes.map(node => `译:${node.textContent}`));
+        await finishScheduledWork();
+        expect(reads).toBe(0);
+        expect(nodes.map(node => getTranslationState(node)?.phase)).toEqual(['translated','translated']);
+    });
+
+    it.each((['source','identity','boundary'] as const).flatMap(change => [0, 1].map(display => ({change, display}))))('revalidates $change changes made by the prime call before admission in display $display', async ({change, display}) => {
+        runtime.viewportCommitEnabled = true;runtime.nativeBatchEnabled = true;
+        runtime.realTextExtraction = true;runtime.realLiveSlots = true;
+        runtime.config.service = 'google';runtime.config.display = display;runtime.config.translationScope = 'all';
+        runtime.realCore = new TranslationCandidateCore({url:new URL('https://example.com'),scope:'all',adapters:[]});
+        Object.defineProperty(window,'innerWidth',{configurable:true,value:1280});
+        Object.defineProperty(window,'innerHeight',{configurable:true,value:815});
+        document.body.innerHTML = '<p>Independent first source.</p><div><p>Independent second source.</p></div>';
+        const nodes = [...document.querySelectorAll<HTMLElement>('p')];
+        nodes.forEach(node => {setLayoutBox(node,600,60);setViewportRect(node,20,60);});
+        const second = nodes[1]!;
+        const original = second.firstChild as Text;
+        const loadingStates: unknown[] = [];
+        const stopWatching = subscribeTranslationStateChanges((node, state) => {
+            if (node === second && state?.phase === 'loading') loadingStates.push(state);
+        });
+        runtime.requests.mockImplementationOnce(origins => {
+            if (change === 'source') original.data = 'Changed second source.';
+            else if (change === 'identity') second.replaceChild(document.createTextNode(original.data),original);
+            else second.parentElement!.setAttribute('translate','no');
+            return Promise.resolve(origins.map(source => `译:${source}`));
+        });
+        autoTranslateEnglishPage();await finishScheduledWork();
+        stopWatching();
+        expect(getTranslationState(nodes[0]!)?.phase).toBe('translated');
+        if (change === 'boundary') {
+            expect(loadingStates).toHaveLength(0);
+            expect(second.querySelector('.fluent-read-single-slot')).toBeNull();
+            expect(second.textContent).toBe('Independent second source.');
+        } else {
+            expect(getTranslationState(second)?.phase).toBe('translated');
+            expect(getTranslationState(second)?.sourceText).toBe(change === 'source'
+                ? 'Changed second source.' : 'Independent second source.');
+            if (change === 'identity') expect(getTranslationState(second)?.sourceTextNodes).not.toContain(original);
+            restoreOriginalContent();
+            expect(second.textContent).toBe(change === 'source' ? 'Changed second source.' : 'Independent second source.');
+        }
+    });
+
+    it('recollects source ownership after cancelling a mismatched preparation invokes a synchronous abort listener', async () => {
+        runtime.viewportCommitEnabled = true;
+        runtime.realTextExtraction = true;runtime.realLiveSlots = true;
+        runtime.config.service = 'google';runtime.config.translationScope = 'all';
+        runtime.realCore = new TranslationCandidateCore({url:new URL('https://example.com'),scope:'all',adapters:[]});
+        document.body.innerHTML = '<p>Changed source.</p>';
+        const second = document.querySelector<HTMLElement>('p')!;
+        const candidate = {element:second,kind:'content' as const,reason:'abort-boundary',scope:'all' as const};
+        const controller = new AbortController();
+        const entry = {candidate,controller,source:'Previous source.',slots:1,escapedCharacters:30,
+            origins:['Previous source.'],nativeGooglePrimeProof:{origins:['Previous source.'],invocationIdentity:''},
+            settled:false,consumed:false};
+        const owner = {active:true,translationConfig:captureFullPageTranslationConfig(),unchangedCandidates:new WeakMap(),
+            bilingualRemountCapitulations:createBilingualRemountCapitulationRegistry(),translationSlotCache:new Map(),
+            outcomes:{update:vi.fn()},statefulAncestorsByTarget:new WeakMap(),
+            preparedCandidates:new Map([[second,entry]]),preparedSlots:1,preparedEscapedCharacters:30,
+            primedGoogleWaveController:null,...createFullPageRequestSessionState()};
+        controller.signal.addEventListener('abort',()=>{
+            second.replaceChild(document.createTextNode('Changed source.'),second.firstChild!);
+            owner.active = false;
+        });
+        const capturedFreshOwnership: boolean[] = [];
+        const stop = subscribeTranslationStateChanges((node,state) => {
+            if (node === second && state?.phase === 'loading') {
+                capturedFreshOwnership.push(state.sourceTextNodes?.includes(second.firstChild as Text) === true);
+            }
+        });
+        try {
+            const pending = translateTarget(candidate,'single',true,owner as unknown as NonNullable<Parameters<typeof translateTarget>[3]>);
+            const settled = pending.catch(error => error);
+            await finishScheduledWork();expect(await settled).toMatchObject({status:'stale'});
+            expect(controller.signal.aborted).toBe(true);
+            expect(capturedFreshOwnership.length).toBeGreaterThan(0);
+            expect(capturedFreshOwnership.every(Boolean)).toBe(true);
+            expect(second.textContent).toBe('Changed source.');
+        } finally {stop();}
     });
 
     // 站点属性变化复用真实候选和规则，验证边界清理与异步提交。
@@ -3038,6 +3185,16 @@ describe("全文翻译可见性锚点", () => {
         },
     );
 
+    it.each([true, false])('native singleton keeps the frozen durable-cache preference (%s)', async useCache => {
+        runtime.nativeBatchEnabled = true;
+        const session = {active: true, translationSlotCache: new Map()};
+        const snapshot = translationSnapshot({service: 'google', useCache});
+        await expect(translateTextSlots(['Singleton source'], snapshot, undefined, undefined, session))
+            .resolves.toEqual(['译:Singleton source']);
+        expect(runtime.requests).toHaveBeenCalledOnce();
+        expect(runtime.requestOptions[0]).toMatchObject({useCache, flushNativePageBatch: true});
+    });
+
     it('Google 全文原生跨候选请求以 32 个文本槽为上限，并把页面波次标记交给 provider', async () => {
         runtime.nativeBatchEnabled = true;
         const session = {active: true, translationSlotCache: new Map()};
@@ -3160,9 +3317,45 @@ describe("全文翻译可见性锚点", () => {
         expect(runtime.requestOptions[0]).not.toHaveProperty('aiMultiSegment');
     });
 
-    it('Google viewport 在不写远处 DOM 的前提下预准备二十个可见候选，DOM 生命周期仍受十个并发槽限制', async () => {
+    it.each(['content', 'control'] as const)('primes selected synthetic %s roots with the visible wave before creating translation DOM', async kind => {
+        runtime.nativeBatchEnabled = true;
+        runtime.realTextExtraction = true;
+        runtime.realLiveSlots = true;
+        runtime.viewportCommitEnabled = true;
+        runtime.config.service = 'google';
+        runtime.config.display = 0;
+        runtime.config.maxConcurrentTranslations = 10;
+        Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1200});
+        Object.defineProperty(window, 'innerHeight', {configurable: true, value: 800});
+        document.body.innerHTML = '<div id="synthetic"> Selected prefix <strong>Selected emphasis<code>protected code</code></strong><p>Unselected sibling.</p></div><p id="body">Visible body.</p>';
+        const owner = document.querySelector<HTMLElement>('#synthetic')!;
+        const body = document.querySelector<HTMLElement>('#body')!;
+        const originalNodes = [...owner.childNodes];
+        runtime.candidates = [{element: owner, nodes: originalNodes.slice(0, 2), kind, reason: 'selected-roots'},
+            {element: body, kind: 'content', reason: 'visible-body'}];
+        [owner, body].forEach(element => {setLayoutBox(element, 600, 60);setViewportRect(element, 20, 60);});
+        const release = deferred<void>();
+        runtime.requests.mockImplementation(origins => {
+            expect(document.querySelector('[data-fr-translation-segment="true"]')).toBeNull();
+            return release.promise.then(() => origins.map(origin => `译:${origin}`));
+        });
+        autoTranslateEnglishPage();
+        await vi.advanceTimersByTimeAsync(51);
+        await waitForRequestCount(1);
+        expect(runtime.requests.mock.calls[0]![0]).toEqual(['Selected prefix', 'Selected emphasis', 'Visible body.']);
+        release.resolve();
+        await finishScheduledWork();
+        expect(runtime.requests).toHaveBeenCalledOnce();
+        restoreOriginalContent();
+        expect([...owner.childNodes]).toEqual(originalNodes);
+        expect(owner.textContent).toBe(' Selected prefix Selected emphasisprotected codeUnselected sibling.');
+    });
+
+    it.each([0, 1])('Google viewport prepares twenty candidates within ten DOM slots and preserves partial cancellation in display %s', async display => {
+        runtime.viewportCommitEnabled = true;
         runtime.nativeBatchEnabled = true;
         runtime.config.service = 'google';
+        runtime.config.display = display;
         runtime.config.fullPageTranslationMode = 'viewport';
         runtime.config.maxConcurrentTranslations = 10;
         Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1200});
@@ -9660,6 +9853,30 @@ describe("悬停重挂请求与 synthetic 提交回归", () => {
         },
     );
 
+    it('shares readonly ancestor styles across an own-mutation prefix of different owners', async () => {
+        runtime.config.display = 0;runtime.config.fullPageTranslationMode = 'all';
+        runtime.config.translationScope = 'all';
+        document.body.innerHTML = '<p>First independent source.</p><p>Second independent source.</p>';
+        const owners = [...document.querySelectorAll<HTMLElement>('p')];
+        runtime.candidates = owners.map(element => ({element,kind:'content',reason:'own-prefix',scope:'all'}));
+        autoTranslateEnglishPage();await finishScheduledWork();
+        const states = owners.map(owner => getTranslationState(owner)!);
+        expect(states.every(state => state.phase === 'translated')).toBe(true);
+        try {
+            runtime.realCore = new TranslationCandidateCore({url:new URL('https://example.com'),scope:'all',adapters:[]});
+            runtime.realLiveSlots = true;runtime.realTextProtection = true;
+            const style = vi.fn((_node: Element) => ({display:'block',visibility:'visible',fontFamily:'serif',getPropertyValue:()=>''}));
+            replaceGlobal('getComputedStyle',style);
+            const records = owners.map((target,index) => ({type:'childList',target,addedNodes:[],
+                removedNodes:[states[index]!.singleTextSlotHosts![0]!.source],oldValue:null} as unknown as MutationRecord));
+            TestMutationObserver.instances[0]!.emit(records);
+            expect(style.mock.calls.filter(([node]) => node === document.body)).toHaveLength(1);
+            expect(owners.map(getTranslationState)).toEqual(states);
+            restoreOriginalContent();
+            expect(owners.map(owner => owner.textContent)).toEqual(['First independent source.','Second independent source.']);
+        } finally {runtime.realCore=null;runtime.realLiveSlots=false;runtime.realTextProtection=false;}
+    });
+
     it.each(['content', 'control'] as const)(
         '宿主悬停反复写入同值 title/lang 时 %s 译文不会被恢复或重挂',
         async (kind) => {
@@ -9968,6 +10185,38 @@ describe("悬停重挂请求与 synthetic 提交回归", () => {
             expect(offscreen.every(node => getTranslationState(node) === undefined)).toBe(true);
         } finally {clock.mockRestore();}
     });
+    it('primes an initial visible prefix while discovery continues but waits to commit the complete screen', async () => {
+        runtime.viewportCommitEnabled = true; runtime.nativeBatchEnabled = true;
+        runtime.config.service = 'google'; runtime.config.display = 0;
+        Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1280});
+        Object.defineProperty(window, 'innerHeight', {configurable: true, value: 815});
+        document.body.innerHTML = '<p id="first">Early visible source.</p>' +
+            Array.from({length: 80}, (_, index) => `<p>Offscreen source ${index}.</p>`).join('') +
+            '<p id="last">Late visible source.</p>';
+        const nodes = [...document.querySelectorAll<HTMLElement>('p')];
+        const first = nodes[0]!; const last = nodes.at(-1)!;
+        nodes.forEach(node => {setLayoutBox(node, 600, 60); setViewportRect(node, 100_000, 60);});
+        setViewportRect(first, 100, 60); setViewportRect(last, 300, 60);
+        runtime.candidates = nodes.map(element => ({element, kind: 'content', reason: 'early-prefix'}));
+        let tailObservedAtFirstRequest: boolean | undefined;
+        runtime.requests.mockImplementation(async origins => {
+            tailObservedAtFirstRequest ??= TestIntersectionObserver.instances[0]!.observed.has(last);
+            return origins.map(origin => `译:${origin}`);
+        });
+        let tick = 0;
+        const clock = vi.spyOn(performance, 'now').mockImplementation(() => ++tick);
+        try {
+            autoTranslateEnglishPage();
+            for (let count = 0; count < 1000 && runtime.requests.mock.calls.length === 0; count++) await vi.advanceTimersByTimeAsync(1);
+            expect(tailObservedAtFirstRequest).toBe(false);
+            expect(getTranslationState(first)).toBeUndefined();
+            TestIntersectionObserver.instances[0]!.emit(first, true);
+            await finishScheduledWork();
+            expect([first, last].map(node => getTranslationState(node)?.phase)).toEqual(['translated', 'translated']);
+            expect(nodes.slice(1, -1).every(node => !getTranslationState(node))).toBe(true);
+        } finally {clock.mockRestore();}
+    });
+
     it('initial viewport requests do not wait for the mutation debounce', async () => {
         runtime.viewportCommitEnabled = true;
         runtime.config.display = 1;
@@ -10050,26 +10299,75 @@ describe("悬停重挂请求与 synthetic 提交回归", () => {
         expect(nodes.map(node => getTranslationState(node)?.phase)).toEqual(['translated', 'translated']);
     });
 
-    async function stagedViewportPair() {
+    async function stagedViewportPair(resolveFirst = true, display = 1, inlineSecond = false) {
         runtime.viewportCommitEnabled = true;
-        runtime.config.display = 1;
+        runtime.config.display = display;
         runtime.config.maxConcurrentTranslations = 2;
         Object.defineProperty(window, 'innerWidth', {configurable: true, value: 1280});
         Object.defineProperty(window, 'innerHeight', {configurable: true, value: 815});
         document.body.innerHTML = '<p>Independent source one.</p><p>Independent source two.</p>';
         const nodes = Array.from(document.querySelectorAll<HTMLElement>('p'));
+        if (inlineSecond) nodes[1]!.innerHTML = 'Independent source <em>two.</em>';
         nodes.forEach(node => {setLayoutBox(node, 600, 60);setViewportRect(node, 20, 60);});
         runtime.candidates = nodes.map(element => ({element, kind: 'content' as const, reason: 'atomic-pair'}));
         const requests = [deferred<string[]>(), deferred<string[]>()];
         let index = 0;
         runtime.requests.mockImplementation(origins => requests[index++]?.promise ?? Promise.resolve(origins.map(origin => `译:${origin}`)));
         autoTranslateEnglishPage();await vi.advanceTimersByTimeAsync(51);await waitForRequestCount(2);
-        requests[0]!.resolve(['译:Independent source one.']);
+        if (resolveFirst) requests[0]!.resolve(['译:Independent source one.']);
         for (let step = 0; step < 8; step++) await Promise.resolve();
         await vi.advanceTimersByTimeAsync(1);
         expect(nodes[0]!.querySelector('.fluent-read-bilingual-content')).toBeNull();
         return {nodes, requests};
     }
+    it('stages single-mode replies without rereading sources until the visible group can commit', async () => {
+        const {nodes, requests} = await stagedViewportPair(false, 0);
+        runtime.sourceReads.mockClear();
+        requests[0]!.resolve(['译:Independent source one.']);
+        for (let step = 0; step < 12; step++) await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(nodes[0]!.querySelector('.fluent-read-single-slot')).toBeNull();
+        expect(runtime.sourceReads).not.toHaveBeenCalled();
+        requests[1]!.resolve(['译:Independent source two.']);
+        await finishScheduledWork();
+        expect(runtime.sourceReads).toHaveBeenCalled();
+        expect(nodes.map(node => getTranslationState(node)?.phase)).toEqual(['translated', 'translated']);
+    });
+    it('rechecks a single-mode source boundary after its result was staged', async () => {
+        const {nodes, requests} = await stagedViewportPair(true, 0);
+        const original = nodes[0]!.firstChild;
+        nodes[0]!.setAttribute('translate', 'no');
+        requests[1]!.resolve(['译:Independent source two.']);
+        await finishScheduledWork();
+        expect(nodes[0]!.firstChild).toBe(original);
+        expect(nodes[0]!.textContent).toBe('Independent source one.');
+        expect(nodes[0]!.querySelector('.fluent-read-single-slot')).toBeNull();
+        expect(getTranslationState(nodes[1]!)?.phase).toBe('translated');
+    });
+    it.each([false, true])('rejects a sibling source changed synchronously during atomic commit (same aggregate: %s)', async sameAggregate => {
+        const {nodes, requests} = await stagedViewportPair(false, 0, sameAggregate);
+        const second = nodes[1]!;
+        const original = second.firstChild!;
+        const inline = second.querySelector('em')?.firstChild;
+        const insert = nodes[0]!.insertBefore.bind(nodes[0]!);
+        vi.spyOn(nodes[0]!, 'insertBefore').mockImplementation((node, reference) => {
+            if (sameAggregate) {
+                original.nodeValue = 'Independent source t';
+                inline!.nodeValue = 'wo.';
+            } else original.nodeValue = 'A host edit during the preceding sibling commit.';
+            return insert(node, reference);
+        });
+        requests[0]!.resolve(['译:Independent source one.']);
+        requests[1]!.resolve(sameAggregate ? ['译:Independent source', '译:two.'] : ['译:Independent source two.']);
+        await finishScheduledWork();
+        expect(getTranslationState(nodes[0]!)?.phase).toBe('translated');
+        expect(second.contains(original)).toBe(true);
+        expect(original.nodeValue).toBe(sameAggregate ? 'Independent source t' : 'A host edit during the preceding sibling commit.');
+        if (inline) expect(inline.nodeValue).toBe('wo.');
+        const outputs = Array.from(second.querySelectorAll('.fluent-read-single-slot')).map(node => node.getAttribute('aria-label'));
+        expect(outputs).not.toContain('译:Independent source two.');
+        expect(outputs).not.toContain('译:two.');
+    });
     it('viewport group cancellation drops staged results and restores original text node identity', async () => {
         const {nodes, requests} = await stagedViewportPair();
         const originals = nodes.map(node => node.firstChild);

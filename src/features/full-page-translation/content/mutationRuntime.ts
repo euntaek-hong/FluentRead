@@ -4,7 +4,7 @@
  * 主要内容：过滤自身 DOM 变更，复验宿主属性和文本槽，分片回收失联候选并协调重扫与重试。
  * 模块边界：不持有全局会话，不实现 provider 请求或用户配置。
  */
-import {getComposedParent, getCurrentTranslationCore, getTranslationCandidateKey} from "@/src/core/translation/public";
+import {getComposedParent, getCurrentTranslationCore, getTranslationCandidateKey, withTranslationDOMReadBatch} from "@/src/core/translation/public";
 import type {TranslationCandidate} from "@/src/core/translation/public";
 import {ensureTranslationTruncationLayout} from "@/src/features/full-page-translation/content/layout";
 import {stabilizeBilingualArtifact, type RemovedTranslationOwnerResolver} from '@/src/features/full-page-translation/content/bilingualRemount';
@@ -80,6 +80,7 @@ function isIntactLoadingSyntheticChildList(
 function isOwnMutation(
     mutation: MutationRecord,
     loadingSyntheticChecks: WeakMap<TranslationState, boolean>,
+    sourceIsCurrent: ReturnType<typeof createTranslationMutationStabilityChecks>['sourceIsCurrent'],
 ): boolean {
     const mutationElement = mutationTargetElement(mutation.target);
     // 框架在 hover/render 时会重复写入相同属性。相同值没有来源或展示变化，
@@ -102,7 +103,7 @@ function isOwnMutation(
     const state = target ? getTranslationState(target as HTMLElement) : undefined;
     if (!target || !state) return false;
     if (isOwnSyntheticSegmentMarkerMutation(mutation, target, state,
-        () => statefulSourceAndTextSlotsAreCurrent(target, state))) return true;
+        () => sourceIsCurrent(target, state))) return true;
     if (isOwnStateArtifactMutation(mutation, target, state)) return true;
     if (state.phase === "error") {
         // 失败 UI 是扩展拥有的状态，不是宿主编辑；若缺少此分支，其 class mutation
@@ -139,7 +140,7 @@ function isOwnMutation(
         return false;
     }
     if (state.phase !== "translated") return false;
-    if (isOwnSingleTextSlotMove(mutation, target, state)) return true;
+    if (isOwnSingleTextSlotMove(mutation, target, state, sourceIsCurrent)) return true;
     if (state.mode === "single" && mutation.type === "characterData") {
         const textNode = mutation.target as Text;
         return state.textSlotsApplied === true &&
@@ -501,8 +502,15 @@ function createFullPageMutationObserver(
                 attributeBatch.invalidate();
             },
         };
-        for (const mutation of mutations) {
-            if (isOwnMutation(mutation, loadingSyntheticChecks)) continue;
+        let ownPrefix = 0;
+        if (core.adapters.length === 0) withTranslationDOMReadBatch(() => {
+            // 连续自有事务只读 DOM；遇到第一条宿主变更立即结束共享，再按原顺序恢复/重启。
+            while (ownPrefix < mutations.length &&
+                isOwnMutation(mutations[ownPrefix]!, loadingSyntheticChecks, reads.sourceIsCurrent)) ownPrefix += 1;
+        });
+        for (let index = ownPrefix; index < mutations.length; index += 1) {
+            const mutation = mutations[index]!;
+            if (isOwnMutation(mutation, loadingSyntheticChecks, reads.sourceIsCurrent)) continue;
             const mutationElement = mutationTargetElement(mutation.target);
             if (mutation.type === 'attributes' && mutationElement && mutation.attributeName &&
                 !shouldCheckAttribute(mutationElement, mutation.attributeName)) continue;

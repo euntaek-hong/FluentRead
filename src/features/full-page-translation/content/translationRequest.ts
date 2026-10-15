@@ -667,7 +667,11 @@ async function executeTranslationBatch(tasks: TranslationBatchTask[], queue: Tra
     if (activeTasks.length === 1) {
         const task = activeTasks[0]!;
         try {
-            resolveTranslationBatchTask(task, await translateTextSlotsDirectly(
+            const translations = native ? await translateArrayWithValidation(
+                task.origins, task.snapshot,
+                {signal: task.signal, queueSession: task.queueSession, flushNativePageBatch: task.flushNativePageBatch},
+                task.context, task.discourseContext,
+            ) : await translateTextSlotsDirectly(
                 task.origins,
                 task.snapshot,
                 task.signal,
@@ -677,7 +681,8 @@ async function executeTranslationBatch(tasks: TranslationBatchTask[], queue: Tra
                 task.context,
                 task.discourseContext,
                 task.flushNativePageBatch,
-            ));
+            );
+            resolveTranslationBatchTask(task, translations);
         } catch (error) {
             if (!native && shouldFallbackAITranslationBatch(error)) {
                 queue.disabledAIKeys.add(task.aiCircuitKey);
@@ -1004,7 +1009,9 @@ async function translateTextSlotsInternal(
         : translatedIndexes.map((index) => origins[index] ?? '');
     // runtime이 exact viewport slots를 먼저 prime한 경우에는 outer request-cache key가
     // 후보별로 달라도 prime-owned slot promise를 직접 소비한다.
-    if (fullPageSession?.active && requestOrigins.length > 0 && requestOrigins.every(origin =>
+    if (snapshot.service === services.google && snapshot.enableNativeBatch !== false
+        && fullPageSession?.active && fullPageSession.allowNativeBatch !== false
+        && !forceFailedRequest && requestOrigins.length > 0 && requestOrigins.every(origin =>
         fullPageSession.translationSlotCache.get(createCacheKey(origin, snapshot))?.nativeGooglePrime === true,
     )) {
         return translateTextSlotsDirectly(origins, snapshot, signal, queueSession, fullPageSession);
