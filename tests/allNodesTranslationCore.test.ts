@@ -37,6 +37,30 @@ afterEach(() => {
 });
 
 describe('explicit all-nodes translation scope', () => {
+    it('covers WSJ top navigation and complementary sidebar including late additions without translating protected controls', () => {
+        const {document, core} = page(`
+            <header><nav><a id="world" href="/world"><span>World</span></a><a id="markets" href="/markets">Markets</a></nav></header>
+            <main><article><h1 id="headline">Inflation unexpectedly rises</h1><p id="body">Markets adjust to the latest economic figures.</p></article></main>
+            <aside role="complementary"><h2 id="popular">Most Popular News</h2><a id="related" href="/news"><span>Mark Zuckerberg Versus the Pint of Guinness</span></a>
+                <div translate="no" id="protected">Publisher protected label</div><input id="search" value="User search text"><code id="code">price_change()</code>
+            </aside>
+        `, 'https://www.wsj.com/finance/stocks/inflation-newsletter');
+        expect(core('content').discover(document).map(source)).not.toContain('Most Popular News');
+        const all = core();
+        const candidates = all.discover(document);
+        expect(candidates.map(candidate => candidate.element.id)).toEqual(['world','markets','headline','body','popular','related']);
+        expect(candidates.every(candidate => candidate.scope === 'all')).toBe(true);
+        for (const id of ['world','markets','popular','related']) expect(all.resolve(document.getElementById(id))).not.toBeNull();
+        const late = document.createElement('div');
+        late.innerHTML = '<h3 id="recommended">Recommended Videos</h3><a id="video">The Space Force Showdown</a>';
+        document.querySelector('aside')!.append(late);
+        expect(all.discover(late).map(candidate => candidate.element.id)).toEqual(['recommended','video']);
+        expect(core('content').discover(late)).toEqual([]);
+        expect(all.shouldIgnoreMutation(document.getElementById('video')!)).toBe(false);
+        expect(all.resolve(document.getElementById('search'))).toBeNull();
+        expect(all.resolve(document.getElementById('protected'))).toBeNull();
+        expect(all.resolve(document.getElementById('code'))).toBeNull();
+    });
     it('Epoch 导航与页脚链接进入全部节点范围，并保持整段正文及内联链接为一个候选', () => {
         const {document, core} = page(`
             <header><nav><a id="research" href="/research"><span>Research</span></a><a id="data" href="/data">Data</a></nav></header>

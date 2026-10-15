@@ -1,12 +1,13 @@
 import {beforeEach,describe,expect,it,vi} from 'vitest';
 const state=vi.hoisted(()=>({manifest:{},apply:vi.fn(async(_port:unknown)=>{}),
+    coverage:vi.fn(async(_port:unknown)=>{}),
     config:{maxConcurrentTranslations:10,translationRequestsPerSecond:10},patch:vi.fn(async()=>{})}));
-vi.mock('@/src/app/background/personalPerformancePreset',()=>({applyPersonalPerformancePreset:state.apply}));
+vi.mock('@/src/app/background/personalPerformancePreset',()=>({applyPersonalPerformancePreset:state.apply,applyPersonalCoveragePreset:state.coverage}));
 vi.mock('@/src/services/config/store',()=>({config:state.config,configReady:Promise.resolve(),requestConfigPatch:state.patch}));
 import {installPersonalPerformancePreset} from '@/src/app/background/personalPerformanceRuntime';
 
 describe('personal Firefox performance preset wiring',()=>{
-    beforeEach(()=>{vi.clearAllMocks();state.apply.mockResolvedValue(undefined);state.manifest={};
+    beforeEach(()=>{vi.clearAllMocks();state.apply.mockResolvedValue(undefined);state.coverage.mockResolvedValue(undefined);state.manifest={};
         vi.stubGlobal('browser',{runtime:{getManifest:()=>state.manifest},storage:{local:{get:vi.fn(async()=>({personalPerformancePresetV1:true})),set:vi.fn(async()=>{})}}});});
     it('does not start for the original ID',()=>{installPersonalPerformancePreset();expect(state.apply).not.toHaveBeenCalled();});
     it('does not start when manifest APIs are absent',()=>{vi.stubGlobal('browser',{});installPersonalPerformancePreset();expect(state.apply).not.toHaveBeenCalled();});
@@ -25,5 +26,21 @@ describe('personal Firefox performance preset wiring',()=>{
         state.manifest={browser_specific_settings:{gecko:{id:'fluent-read@euntaek-hong'}}};const error=Error('conflict');state.apply.mockRejectedValueOnce(error);
         const log=vi.spyOn(console,'error').mockImplementation(()=>{});installPersonalPerformancePreset();await Promise.resolve();
         expect(log).toHaveBeenCalledWith('[FluentRead Personal] 请求预算升级失败',error);expect(browser.storage.local.set).not.toHaveBeenCalled();log.mockRestore();
+    });
+    it('migrates coverage independently of the already completed budget upgrade',async()=>{
+        state.manifest={browser_specific_settings:{gecko:{id:'fluent-read@euntaek-hong'}}};
+        vi.mocked(browser.storage.local.get).mockResolvedValue({personalPerformancePresetV1:true});
+        installPersonalPerformancePreset();
+        const port=state.coverage.mock.calls[0]![0] as import('@/src/app/background/personalPerformancePreset').PersonalCoveragePresetPort;
+        expect(await port.completed()).toBe(false);await port.ready();expect(port.current()).toBe(state.config);
+        await port.patch({translationScope:'all'});expect(state.patch).toHaveBeenCalledWith({translationScope:'all'});
+        await port.markComplete();expect(browser.storage.local.set).toHaveBeenCalledWith({personalTranslationCoverageV1:true});
+        vi.mocked(browser.storage.local.get).mockResolvedValue({personalTranslationCoverageV1:true});expect(await port.completed()).toBe(true);
+        vi.mocked(browser.storage.local.get).mockResolvedValue({personalTranslationCoverageV1:'yes'});expect(await port.completed()).toBe(false);
+    });
+    it('reports a failed coverage migration without writing its marker',async()=>{
+        state.manifest={browser_specific_settings:{gecko:{id:'fluent-read@euntaek-hong'}}};const error=Error('coverage conflict');state.coverage.mockRejectedValueOnce(error);
+        const log=vi.spyOn(console,'error').mockImplementation(()=>{});installPersonalPerformancePreset();await Promise.resolve();
+        expect(log).toHaveBeenCalledWith('[FluentRead Personal] 翻译范围升级失败',error);expect(browser.storage.local.set).not.toHaveBeenCalled();log.mockRestore();
     });
 });
