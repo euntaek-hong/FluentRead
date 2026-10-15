@@ -3,6 +3,7 @@
  *
  * 文件职责：封装翻译候选发现使用的 composed tree 遍历与不可覆盖安全守卫，识别扩展 DOM、其他翻译器已接管的段落、脚本、表单、图标字体、代码及禁止翻译区域。
  * 主要内容：提供抗表单命名属性遮蔽的标签读取、Shadow DOM 父级与祖先遍历、硬裁剪标签、按钮型 input 的可译标签属性判定、受保护文本元素（含 time 与 timer）、text/plain 顶层 pre、独立 tooltip 边界、隐藏/可编辑/no-translate 判断，并限制祖先深度以避免异常页面结构拖垮扫描；语言预检可单独读取行内 code 上下文，仍遵守其他保护及代码块祖先边界，默认翻译槽继续排除代码。 可核对的公开符号包括 maxComposedAncestorDepth、getComposedParent、isDocumentSurface、isExtensionElementSelf、getTranslatableControlValueAttribute、isHardPruneTag、isProtectedTextElement、isPlainTextDocumentPre、hasNoTranslateMarker、isDocumentSurfaceNoTranslateShell、isTopLevelApplicationShell。
+ * 同步只读批次：withTranslationDOMReadBatch 只在同一同步只读调用中复用元素硬守卫、显示、图标字体及按语言/来源槽/外壳权限隔离的后代保护检查；不复用站点/外壳上下文判定。离开作用域或抛错即清理，不跨 DOM 写入、generator yield 或异步边界缓存保护结论。
  * 模块边界：本文件属于可独立测试的 core 候选领域；可以读取传入 DOM 以计算结果，但不访问配置存储、不调用 provider、不注册页面监听器，也不负责译文渲染或 feature 生命周期。
  */
 
@@ -87,6 +88,7 @@ export function isExtensionElementSelf(element: Element): boolean {
 export function isForeignTranslationBoundary(element: Element): boolean {
     if (element.classList.contains(foreignTranslationWrapperClass)) return true;
     if (isDocumentSurface(element)) return false;
+    if (element.childElementCount === 0) return false;
     if (directChildHasSupport.get(element.ownerDocument) !== false) {
         try {
             return element.matches(`:has(> .${foreignTranslationWrapperClass})`);
@@ -186,14 +188,68 @@ export interface TranslationTextProtectionOptions {
 }
 
 /** 同一次样式读取同时识别不可见节点和以连字作为字形索引的图标，避免候选热路径重复查询样式。 */
+let presentationReads: WeakMap<Element, 'hidden' | 'icon-font' | undefined> | undefined;
+let computedStyleReads: WeakMap<Element, CSSStyleDeclaration | undefined> | undefined;
+interface DescendantProtectionRead {
+    ignoreExtensionSelf: boolean;
+    ownSourceSlot: boolean;
+    includeInlineCodeForLanguage: boolean;
+    allowTopLevelApplicationShell: boolean;
+    protectedElement?: Element;
+    result: boolean;
+}
+let descendantProtectionReads: WeakMap<Element, DescendantProtectionRead[]> | undefined;
+let hardGuardReads: WeakMap<Element, HardGuardResult> | undefined;
+let readBatchToken: object | undefined;
+
+/** 内部算法用此不透明标识隔离同一同步只读阶段的缓存，不保留跨阶段 DOM 结论。 */
+export function getTranslationDOMReadBatchToken(): object | undefined { return readBatchToken; }
+
+/** 同一只读阶段的显示分类和保护检查共享原生 CSSOM 读取，不跨 DOM 写入保留。 */
+export function readTranslationComputedStyle(element: Element): CSSStyleDeclaration | undefined {
+    if (computedStyleReads?.has(element)) return computedStyleReads.get(element);
+    const style = element.ownerDocument?.defaultView?.getComputedStyle(element);
+    computedStyleReads?.set(element, style);
+    return style;
+}
+
+/** 仅在同步只读回调中共享样式判定；让出、写入及异常后绝不保留。 */
+export function withTranslationDOMReadBatch<T>(read: () => T): T {
+    const previous = presentationReads;
+    const previousStyles = computedStyleReads;
+    const previousDescendants = descendantProtectionReads;
+    const previousGuards = hardGuardReads;
+    const previousToken = readBatchToken;
+    presentationReads = previous ?? new WeakMap();
+    computedStyleReads = previousStyles ?? new WeakMap();
+    descendantProtectionReads = previousDescendants ?? new WeakMap();
+    hardGuardReads = previousGuards ?? new WeakMap();
+    readBatchToken = previousToken ?? {};
+    try { return read(); }
+    finally {
+        presentationReads = previous;
+        computedStyleReads = previousStyles;
+        descendantProtectionReads = previousDescendants;
+        hardGuardReads = previousGuards;
+        readBatchToken = previousToken;
+    }
+}
+
 function getPresentationProtection(element: Element): 'hidden' | 'icon-font' | undefined {
+    if (presentationReads?.has(element)) return presentationReads.get(element);
+    const result = readPresentationProtection(element);
+    presentationReads?.set(element, result);
+    return result;
+}
+
+function readPresentationProtection(element: Element): 'hidden' | 'icon-font' | undefined {
     const htmlElement = element as HTMLElement;
     if (htmlElement.hidden || htmlElement.inert || element.hasAttribute('inert')) return 'hidden';
     if (element.getAttribute('aria-hidden') === 'true') return 'hidden';
     if (element.classList.contains('sr-only') || element.classList.contains('visually-hidden')) return 'hidden';
 
     try {
-        const style = element.ownerDocument?.defaultView?.getComputedStyle(element);
+        const style = readTranslationComputedStyle(element);
         if (!style) return undefined;
         if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return 'hidden';
         // 无障碍辅助文本常没有固定类名，而是绝对定位到 1px 裁剪盒。单独的 overflow
@@ -262,6 +318,29 @@ export function isProtectedDescendantElement(
     options?: TranslationTextProtectionOptions,
 ): boolean {
     const ownSourceSlot = options?.sourceTextSlotHosts?.has(element) === true;
+    if (!descendantProtectionReads) return readProtectedDescendantElement(element, ignoreExtensionSelf, options, ownSourceSlot);
+    const includeInlineCodeForLanguage = options?.includeInlineCodeForLanguage === true;
+    const allowTopLevelApplicationShell = options?.allowTopLevelApplicationShell === true;
+    const protectedElement = allowTopLevelApplicationShell ? options?.protectedElement : undefined;
+    const cached = descendantProtectionReads.get(element);
+    const hit = cached?.find(read => read.ignoreExtensionSelf === ignoreExtensionSelf &&
+        read.ownSourceSlot === ownSourceSlot && read.includeInlineCodeForLanguage === includeInlineCodeForLanguage &&
+        read.allowTopLevelApplicationShell === allowTopLevelApplicationShell && read.protectedElement === protectedElement);
+    if (hit) return hit.result;
+    const result = readProtectedDescendantElement(element, ignoreExtensionSelf, options, ownSourceSlot);
+    const read = {ignoreExtensionSelf, ownSourceSlot, includeInlineCodeForLanguage,
+        allowTopLevelApplicationShell, protectedElement, result};
+    if (cached) cached.push(read);
+    else descendantProtectionReads.set(element, [read]);
+    return result;
+}
+
+function readProtectedDescendantElement(
+    element: Element,
+    ignoreExtensionSelf: boolean,
+    options: TranslationTextProtectionOptions | undefined,
+    ownSourceSlot: boolean,
+): boolean {
     const ownNoTranslateMarker = ownSourceSlot &&
         element.getAttribute('translate')?.toLowerCase() === 'no' &&
         !element.classList.contains('notranslate') && element.getAttribute('data-notranslate') !== 'true';
@@ -286,6 +365,16 @@ export interface HardGuardResult {
 }
 
 export function evaluateElementHardGuard(element: Element): HardGuardResult {
+    if (!hardGuardReads) return readElementHardGuard(element);
+    const cached = hardGuardReads.get(element);
+    if (cached) return {...cached};
+    const result = readElementHardGuard(element);
+    hardGuardReads.set(element, result);
+    // 返回值保持原有可变对象契约，但不能让调用者改写批次里的保护结论。
+    return {...result};
+}
+
+function readElementHardGuard(element: Element): HardGuardResult {
     if (isExtensionElementSelf(element)) return {prune: true, reason: 'fluentread-owned'};
     if (isForeignTranslationBoundary(element)) return {prune: true, reason: 'foreign-translation'};
     if (isHardPruneTag(element)) return {prune: true, reason: `protected-tag:${getElementTagName(element)}`};

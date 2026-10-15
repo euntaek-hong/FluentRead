@@ -5,6 +5,7 @@ import {
     applyTranslationsToSnapshot,
     buildWholeBlockTranslationSource,
     collectLiveTranslationTextSlots,
+    collectLiveTranslationTextSlotsFromNodes,
     createDeclarativeAdapter,
     createTranslationCore,
     createCurrentTranslationResolverBatch,
@@ -22,6 +23,303 @@ import {
     resolveTranslationCandidateAtPoint,
 } from '@/src/core/translation/public';
 import {shouldSkipTranslationForTarget} from '@/src/core/language/detect';
+import * as translationDom from '@/src/core/translation/dom';
+import {readDiscoveryStep} from '@/src/features/full-page-translation/content/discoveryReadStep';
+import {getElementDisplay} from '@/src/core/translation/layout';
+
+describe('direct light Text readers', () => {
+    it.each(['p', 'h2', 'a', 'button'])('keeps exact %s source and slots without allocating a native walker', tag => {
+        const {document} = parseHTML(`<html><body><${tag}>  Readable source.\t </${tag}></body></html>`);
+        const element = document.body.firstElementChild as HTMLElement;
+        const walker = vi.spyOn(document, 'createTreeWalker');
+        try {
+            expect(hasMeaningfulTranslationTextInNodes([element])).toBe(true);
+            expect(extractTranslationText(element)).toBe('Readable source.');
+            expect(collectLiveTranslationTextSlots(element)).toEqual([
+                {node:element.firstChild,prefix:'  ',source:'Readable source.',suffix:'\t '},
+            ]);
+            expect(walker).not.toHaveBeenCalled();
+        } finally {walker.mockRestore();}
+    });
+
+    it('keeps discovery truncation and descendant protection on direct leaves', () => {
+        const {document} = parseHTML('<html><body><p></p><a href="/">example.com</a></body></html>');
+        const element = document.querySelector('p')!;
+        element.textContent = '0'.repeat(8192) + ' readable words';
+        expect(hasMeaningfulTranslationTextInNodes([element])).toBe(false);
+        for (const marker of ['hidden', 'translate']) {
+            element.textContent = 'Readable source.';
+            element.setAttribute(marker,marker === 'translate' ? 'no' : '');
+            expect(hasMeaningfulTranslationTextInNodes([element])).toBe(false);
+            expect(extractTranslationText(element)).toBe('');
+            expect(collectLiveTranslationTextSlots(element as HTMLElement)).toEqual([]);
+            element.removeAttribute(marker);
+        }
+        expect(collectLiveTranslationTextSlots(document.querySelector('a')!)).toEqual([]);
+    });
+
+    it('retains the general path for comments and language-context reads', () => {
+        const {document} = parseHTML('<html><body><p>Readable<!-- boundary --> source.</p><code>camelCaseName</code></body></html>');
+        const walker = vi.spyOn(document,'createTreeWalker');
+        try {
+            expect(extractTranslationText(document.querySelector('p')!)).toBe('Readable source.');
+            expect(walker).toHaveBeenCalled();walker.mockClear();
+            extractTranslationText(document.querySelector('code')!,undefined,undefined,{includeInlineCodeForLanguage:true});
+            expect(walker).toHaveBeenCalled();
+        } finally {walker.mockRestore();}
+    });
+});
+
+describe('bounded discovery read windows', () => {
+    afterEach(() => vi.restoreAllMocks());
+    it('preserves every enter/exit step while ending the cache before consumers and refreshing it on the next slice', () => {
+        const {document} = parseHTML('<html><body><p>Source</p></body></html>');
+        const element = document.querySelector('p')!;
+        const expected = Array.from({length: 140}, (_, index) => ({element,
+            phase: index % 2 ? 'exit' as const : 'enter' as const}));
+        const tokens: Array<object | undefined> = [];
+        const guards: boolean[] = [];
+        function* discovery() {
+            for (const step of expected) {
+                tokens.push(translationDom.getTranslationDOMReadBatchToken());
+                guards.push(translationDom.evaluateHardGuard(element).prune);
+                yield step;
+            }
+        }
+        const iterator = discovery();
+        const first = readDiscoveryStep(iterator, false);
+        expect(first.value).toEqual(expected[0]);
+        expect(first.done).toBe(false);
+        expect(tokens[0]).toBeDefined();
+        expect(new Set(tokens).size).toBe(1);
+        expect(translationDom.getTranslationDOMReadBatchToken()).toBeUndefined();
+        element.setAttribute('translate', 'no');
+        const consumed = [first.value];
+        for (let next = readDiscoveryStep(iterator, false); !next.done; next = readDiscoveryStep(iterator, false)) {
+            consumed.push(next.value);
+            expect(translationDom.getTranslationDOMReadBatchToken()).toBeUndefined();
+        }
+        expect(consumed).toEqual(expected);
+        expect(tokens[1]).not.toBe(tokens[0]);
+        expect(guards[0]).toBe(false);
+        expect(guards.slice(1).every(Boolean)).toBe(true);
+    });
+
+    it('keeps adapter callbacks unbatched and never runs the generator ahead of a consumer', () => {
+        const {document} = parseHTML('<html><body><p>Source</p></body></html>');
+        const element = document.querySelector('p')!;
+        const tokens: Array<object | undefined> = [];
+        function* discovery() {
+            for (let i = 0; i < 3; i++) {
+                tokens.push(translationDom.getTranslationDOMReadBatchToken());
+                yield {element, phase: 'enter' as const};
+            }
+        }
+        const generic = discovery();
+        expect(readDiscoveryStep(generic, false).done).toBe(false);
+        expect(tokens).toHaveLength(1);
+        expect(tokens[0]).toBeDefined();
+        const adapted = discovery();
+        expect(readDiscoveryStep(adapted, true).done).toBe(false);
+        expect(tokens[1]).toBeUndefined();
+        expect(readDiscoveryStep(adapted, true).done).toBe(false);
+        expect(tokens).toHaveLength(3);
+    });
+
+    it('clears the read context even if discovery throws', () => {
+        function* discovery(): Generator<never> { throw new Error('discovery failed'); }
+        expect(() => readDiscoveryStep(discovery(), false)).toThrow('discovery failed');
+        expect(translationDom.getTranslationDOMReadBatchToken()).toBeUndefined();
+    });
+});
+
+describe('adapter-free ancestry work', () => {
+    it('does not allocate pass decisions for ancestors when no adapter can prune them', () => {
+        const {document} = parseHTML('<html><body><article><p>Readable source.</p></article></body></html>');
+        const element = document.querySelector('p')!;
+        const core = new TranslationCandidateCore({url:new URL('https://fixture.test'),scope:'all',adapters:[]});
+        const decisions = vi.spyOn(core as unknown as {adapterDecision(element: Element): unknown},'adapterDecision');
+        expect(core.inspect(element).candidate?.element).toBe(element);
+        expect(decisions.mock.calls.map(([node]) => node)).toEqual([element]);
+    });
+
+    it('still honors matching adapter ancestor pruning', () => {
+        const {document} = parseHTML('<html><body><section><p>Protected by the site adapter.</p></section></body></html>');
+        const element = document.querySelector('p')!;
+        const core = new TranslationCandidateCore({url:new URL('https://fixture.test'),scope:'all',adapters:[{
+            id:'pruned-section',allScopes:true,matches:()=>true,
+            decide: node => node.localName === 'section'
+                ? {kind:'prune-subtree',reason:'site-protection'} : {kind:'pass'},
+        }]});
+        expect(core.inspect(element).candidate).toBeNull();
+    });
+});
+
+describe('bounded live slots from selected roots', () => {
+    it('reads only selected roots and preserves protected descendants and the owner tooltip boundary', () => {
+        const {document} = parseHTML('<html><body><p> First <strong>Second<code>code</code><span translate="no">kept</span><span hidden>hidden</span><span role="tooltip">tooltip</span></strong><i>Outside</i></p></body></html>');
+        const owner = document.querySelector('p')!;
+        const first = owner.firstChild as Text;
+        const strong = owner.querySelector('strong')!;
+        const walker = vi.spyOn(document, 'createTreeWalker');
+        const slots = collectLiveTranslationTextSlotsFromNodes(owner, [first, strong, strong.firstChild!, document.createTextNode('Detached')]);
+        expect(slots.map(slot => slot.source)).toEqual(['First', 'Second']);
+        expect(slots[0]).toMatchObject({node: first, prefix: ' ', suffix: ' '});
+        expect(walker.mock.calls.map(([root]) => root)).toEqual([strong]);
+        expect(owner.textContent).toBe(' First SecondcodekepthiddentooltipOutside');
+    });
+
+    it('keeps selected root order and never creates a translation wrapper', () => {
+        const {document} = parseHTML('<html><body><p> First <b>Second</b> Third </p></body></html>');
+        const owner = document.querySelector('p')!;
+        const third = owner.lastChild as Text;
+        const first = owner.firstChild as Text;
+        const nodes = [...owner.childNodes];
+        const slots = collectLiveTranslationTextSlotsFromNodes(owner, [third, first]);
+        expect(slots.map(slot => slot.source)).toEqual(['Third', 'First']);
+        expect([...owner.childNodes]).toEqual(nodes);
+        expect(owner.querySelector('[data-fr-translation-owned]')).toBeNull();
+    });
+});
+
+describe('synchronous descendant protection reads', () => {
+    it('shares computed style between display and protection reads but refreshes after a DOM write', () => {
+        const {document, window} = parseHTML('<html><body><div>Readable source.</div></body></html>');
+        const owner = document.querySelector('div')!;
+        const previous = window.getComputedStyle;
+        const style = vi.fn(() => ({display: owner.hasAttribute('hidden') ? 'none' : 'block',
+            visibility:'visible',fontFamily:'Arial'} as CSSStyleDeclaration));
+        window.getComputedStyle = style;
+        try {
+            translationDom.withTranslationDOMReadBatch(() => {
+                expect(getElementDisplay(owner)).toBe('block');
+                expect(translationDom.isHiddenTranslationElement(owner)).toBe(false);
+                expect(getElementDisplay(owner)).toBe('block');
+            });
+            expect(style).toHaveBeenCalledTimes(1);
+            owner.setAttribute('hidden','');
+            expect(getElementDisplay(owner)).toBe('none');
+            expect(style).toHaveBeenCalledTimes(2);
+            owner.removeAttribute('hidden');
+            translationDom.withTranslationDOMReadBatch(() => {
+                expect(getElementDisplay(owner)).toBe('block');
+            });
+            expect(style).toHaveBeenCalledTimes(3);
+        } finally { window.getComputedStyle = previous; }
+    });
+    it('does not run a relational child selector on a text-only element but still detects later foreign wrappers', () => {
+        const {document} = parseHTML('<html><body><p>Plain readable source.</p></body></html>');
+        const owner = document.querySelector('p')!;
+        const matches = vi.spyOn(owner,'matches');
+        expect(translationDom.isForeignTranslationBoundary(owner)).toBe(false);
+        expect(matches).not.toHaveBeenCalled();
+        const foreign = document.createElement('span');
+        foreign.className = 'immersive-translate-target-wrapper';
+        owner.append(foreign);
+        expect(translationDom.isForeignTranslationBoundary(owner)).toBe(true);
+        expect(translationDom.isForeignTranslationBoundary(foreign)).toBe(true);
+        foreign.remove();
+        expect(translationDom.isForeignTranslationBoundary(owner)).toBe(false);
+    });
+    it('shares candidate inspection ancestry only within a synchronous read batch', () => {
+        const {document} = parseHTML('<html><body><p id="first">First readable source</p><p id="second">Second readable source</p></body></html>');
+        const first = document.getElementById('first')!;
+        const second = document.getElementById('second')!;
+        const decide = vi.fn((_element: Element) => ({kind: 'pass' as const}));
+        const core = new TranslationCandidateCore({url:new URL('https://fixture.test'),scope:'all',
+            adapters:[{id:'read-batch',allScopes:true,matches:()=>true,decide}]});
+        translationDom.withTranslationDOMReadBatch(() => {
+            expect(core.inspect(first).candidate?.element).toBe(first);
+            expect(core.inspect(second).candidate?.element).toBe(second);
+            expect(decide.mock.calls.filter(([element]) => element === document.body)).toHaveLength(1);
+        });
+        second.setAttribute('translate', 'no');
+        expect(core.inspect(second).candidate).toBeNull();
+        second.removeAttribute('translate');
+        translationDom.withTranslationDOMReadBatch(() => {
+            expect(core.inspect(second).candidate?.element).toBe(second);
+            expect(decide.mock.calls.filter(([element]) => element === document.body)).toHaveLength(2);
+        });
+    });
+    it('shares inherited text protection for the same policy across collectors but refreshes after the batch', () => {
+        const {document} = parseHTML('<html><body><p id="first">First readable text</p><p id="second">Second readable text</p></body></html>');
+        const first = document.getElementById('first')!;
+        const second = document.getElementById('second')!;
+        const keepOriginal = vi.fn(() => false);
+        translationDom.withTranslationDOMReadBatch(() => {
+            expect(collectLiveTranslationTextSlots(first, keepOriginal)).toHaveLength(1);
+            const firstReads = keepOriginal.mock.calls.length;
+            expect(collectLiveTranslationTextSlots(second, keepOriginal)).toHaveLength(1);
+            expect(keepOriginal.mock.calls).toHaveLength(firstReads + 1);
+            expect(collectLiveTranslationTextSlots(first, () => true)).toHaveLength(0);
+            expect(collectLiveTranslationTextSlots(first, keepOriginal)).toHaveLength(1);
+        });
+        first.setAttribute('translate','no');
+        translationDom.withTranslationDOMReadBatch(() => {
+            expect(collectLiveTranslationTextSlots(first, keepOriginal)).toHaveLength(0);
+        });
+    });
+    it('keeps language permissions separate and rereads explicit mutable source-slot ownership', () => {
+        const {document} = parseHTML('<html><body><code>API</code><span data-fr-translation-owned="true" translate="no">Original source</span></body></html>');
+        const code = document.querySelector('code')!;
+        const owned = document.querySelector('span')!;
+        const sourceTextSlotHosts = new Set<Element>();
+        translationDom.withTranslationDOMReadBatch(() => {
+            expect(collectLiveTranslationTextSlots(code)).toHaveLength(0);
+            expect(collectLiveTranslationTextSlots(code, undefined, undefined, {includeInlineCodeForLanguage:true})).toHaveLength(1);
+            expect(collectLiveTranslationTextSlots(code)).toHaveLength(0);
+            expect(collectLiveTranslationTextSlots(owned, undefined, undefined, {sourceTextSlotHosts})).toHaveLength(0);
+            sourceTextSlotHosts.add(owned);
+            expect(collectLiveTranslationTextSlots(owned, undefined, undefined, {sourceTextSlotHosts})).toHaveLength(1);
+        });
+    });
+    it('reuses raw ancestor hard guards only inside the readonly batch and isolates returned objects', () => {
+        const {document} = parseHTML('<html><body><p>Readable source text</p></body></html>');
+        const element = document.querySelector('p')!;
+        const attributes = vi.spyOn(element, 'getAttribute');
+        translationDom.withTranslationDOMReadBatch(() => {
+            const first = translationDom.evaluateElementHardGuard(element);
+            expect(first).toEqual({prune:false});
+            const count = attributes.mock.calls.length;
+            first.prune = true;
+            expect(translationDom.evaluateElementHardGuard(element)).toEqual({prune:false});
+            expect(attributes.mock.calls).toHaveLength(count);
+        });
+        element.setAttribute('translate','no');
+        expect(translationDom.evaluateElementHardGuard(element)).toEqual({prune:true,reason:'inherited-no-translate'});
+        translationDom.withTranslationDOMReadBatch(() => {
+            expect(translationDom.evaluateElementHardGuard(element)).toEqual({prune:true,reason:'inherited-no-translate'});
+        });
+    });
+    it('reuses identical safety queries but keeps different language and ownership policies separate', () => {
+        const {document} = parseHTML('<html><body><code>API</code></body></html>');
+        const element = document.querySelector('code')!;
+        const attributes = vi.spyOn(element, 'getAttribute');
+        translationDom.withTranslationDOMReadBatch(() => {
+            expect(translationDom.isProtectedDescendantElement(element)).toBe(true);
+            const firstCount = attributes.mock.calls.length;
+            expect(translationDom.isProtectedDescendantElement(element)).toBe(true);
+            expect(attributes.mock.calls).toHaveLength(firstCount);
+            expect(translationDom.isProtectedDescendantElement(element, false, {includeInlineCodeForLanguage: true})).toBe(false);
+        });
+        element.textContent = '中文';
+        translationDom.withTranslationDOMReadBatch(() => {
+            expect(translationDom.isProtectedDescendantElement(element, false, {includeInlineCodeForLanguage: true})).toBe(true);
+        });
+    });
+
+    it('does not reuse own-slot or shell exceptions for a different policy', () => {
+        const {document} = parseHTML('<html><body><span data-fr-translation-owned="true" translate="no">Original</span></body></html>');
+        const element = document.querySelector('span')!;
+        const sourceTextSlotHosts = new Set<Element>();
+        translationDom.withTranslationDOMReadBatch(() => {
+            expect(translationDom.isProtectedDescendantElement(element, false, {sourceTextSlotHosts})).toBe(true);
+            sourceTextSlotHosts.add(element);
+            expect(translationDom.isProtectedDescendantElement(element, false, {sourceTextSlotHosts})).toBe(false);
+            expect(translationDom.isProtectedDescendantElement(element)).toBe(true);
+        });
+    });
+});
 import productionReleaseCases from './fixtures/target-language-releases.json';
 import {
     evaluateHardGuard,
@@ -233,6 +531,64 @@ describe('Explicit non-atomic inline reading containers', () => {
 });
 
 describe('Forced discovery synchronous inspection', () => {
+    it('shares presentation reads only inside a synchronous readonly batch', () => {
+        const {document} = parseHTML('<html><body><main><p>Independent readable source.</p></main></body></html>');
+        const source = document.querySelector('p')!;
+        let hidden = false;
+        const readStyle = vi.fn(() => ({display: hidden ? 'none' : 'block', visibility: 'visible', position: 'static', fontFamily: 'Arial'}));
+        const view = document.defaultView!;
+        const previous = Object.getOwnPropertyDescriptor(view, 'getComputedStyle');
+        Object.defineProperty(view, 'getComputedStyle', {configurable: true, value: readStyle});
+        try {
+            translationDom.withTranslationDOMReadBatch(() => {
+                expect(translationDom.evaluateElementHardGuard(source).prune).toBe(false);
+                expect(translationDom.isProtectedDescendantElement(source)).toBe(false);
+                expect(translationDom.evaluateElementHardGuard(source).prune).toBe(false);
+            });
+            expect(readStyle).toHaveBeenCalledTimes(1);
+            hidden = true;
+            expect(translationDom.evaluateElementHardGuard(source).reason).toBe('hidden');
+            expect(readStyle).toHaveBeenCalledTimes(2);
+            translationDom.withTranslationDOMReadBatch(() => {
+                expect(translationDom.evaluateElementHardGuard(source).reason).toBe('hidden');
+                expect(translationDom.isProtectedDescendantElement(source)).toBe(true);
+            });
+            expect(readStyle).toHaveBeenCalledTimes(3);
+        } finally {
+            if (previous) Object.defineProperty(view, 'getComputedStyle', previous);
+            else Reflect.deleteProperty(view, 'getComputedStyle');
+        }
+    });
+
+    it('drops presentation reads when a batch throws and shares nested readonly reads', () => {
+        const {document} = parseHTML('<html><body><p>A separately checked source.</p></body></html>');
+        const source = document.querySelector('p')!;
+        let hidden = false;
+        const readStyle = vi.fn(() => ({display: hidden ? 'none' : 'block', visibility: 'visible', position: 'static', fontFamily: 'Arial'}));
+        const view = document.defaultView!;
+        const previous = Object.getOwnPropertyDescriptor(view, 'getComputedStyle');
+        Object.defineProperty(view, 'getComputedStyle', {configurable: true, value: readStyle});
+        try {
+            expect(() => translationDom.withTranslationDOMReadBatch(() => {
+                translationDom.evaluateElementHardGuard(source);
+                throw new Error('Interrupted readonly batch');
+            })).toThrow('Interrupted readonly batch');
+            hidden = true;
+            expect(translationDom.evaluateElementHardGuard(source).reason).toBe('hidden');
+            hidden = false;
+            translationDom.withTranslationDOMReadBatch(() => {
+                expect(translationDom.evaluateElementHardGuard(source).prune).toBe(false);
+                translationDom.withTranslationDOMReadBatch(() => {
+                    expect(translationDom.evaluateElementHardGuard(source).prune).toBe(false);
+                });
+                expect(translationDom.evaluateElementHardGuard(source).prune).toBe(false);
+            });
+            expect(readStyle).toHaveBeenCalledTimes(3);
+        } finally {
+            if (previous) Object.defineProperty(view, 'getComputedStyle', previous);
+            else Reflect.deleteProperty(view, 'getComputedStyle');
+        }
+    });
     it.each([false, true])('rescans an inline mutation from its explicit non-atomic reading owner (explicit target: %s)', explicitTarget => {
         const {document} = parseHTML('<html><body><main><div id="owner">The opening remains readable. <span id="bridge"><span id="dirty">The changed inline sentence remains owned.</span></span> The closing remains readable.</div><p id="neighbor">The neighboring paragraph is outside this rescan.</p></main></body></html>');
         const owner = document.getElementById('owner')!;

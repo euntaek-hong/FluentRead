@@ -8,6 +8,7 @@ import {spawnSync} from 'node:child_process';
 import {resolve} from 'node:path';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import modelPost from './fixtures/chinese-language-model-post.json';
+import * as languageIdentification from '@/src/core/language/identify';
 import {
     detectChineseScript,
     detectlang,
@@ -24,6 +25,46 @@ import {
 afterEach(() => {
     clearLanguageIdentificationCache();
     vi.restoreAllMocks();
+});
+
+describe('Chinese font script precheck', () => {
+    it.each(['The report explains changing prices and market conditions.', 'مرحبا بالعالم', 'Привет мир', '한국어', 'カタカナ', '', '123 ✨'])('does not classify text without Han characters for Chinese fonts: %j', source => {
+        const identify = vi.spyOn(languageIdentification, 'identifyTextLanguage');
+        expect(detectChineseScript(source)).toBeUndefined();
+        expect(identify).not.toHaveBeenCalled();
+    });
+    it('keeps the full language policy for mixed text containing Han', () => {
+        const identify = vi.spyOn(languageIdentification, 'identifyTextLanguage');
+        expect(detectChineseScript('这些线程可以互相发送信号。')).toBe('Hans');
+        expect(identify).toHaveBeenCalledOnce();
+    });
+});
+
+describe('Korean target script precheck', () => {
+    it.each(['The report explains a changing market and the evidence behind this decision.', '民主主義生活', 'annyeong haseyo', 'مرحبا بالعالم', 'Привет мир', '123. 🎉', ''])('avoids statistical identification when Korean cannot match %j', source => {
+        const identify = vi.spyOn(languageIdentification, 'identifyTextLanguage');
+        expect(shouldSkipTranslationForTarget(source, 'ko-KR', ['kor'])).toBe(!/\p{L}/u.test(source));
+        expect(identify).not.toHaveBeenCalled();
+    });
+
+    it('keeps the full policy for Hangul and a Latin excluded language', () => {
+        const identify = vi.spyOn(languageIdentification, 'identifyTextLanguage');
+        expect(shouldSkipTranslationForTarget('한국어 문장입니다.', 'ko')).toBe(true);
+        expect(shouldSkipTranslationForTarget('This is a long English sentence with clear evidence from the report.', 'ko', ['en'])).toBe(true);
+        expect(identify).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(['ko-Latn', 'und', 'zzz', 'en'])('retains identification when the exclusion cannot be ruled out (%s)', excluded => {
+        const identify = vi.spyOn(languageIdentification, 'identifyTextLanguage');
+        shouldSkipTranslationForTarget('This is a long English sentence with evidence from the report.', 'ko', [excluded]);
+        expect(identify).toHaveBeenCalledOnce();
+    });
+
+    it('identifies decomposed Hangul through the existing normalization policy', () => {
+        const identify = vi.spyOn(languageIdentification, 'identifyTextLanguage');
+        expect(shouldSkipTranslationForTarget('한국어 문장입니다.'.normalize('NFD'), 'ko')).toBe(true);
+        expect(identify).toHaveBeenCalledOnce();
+    });
 });
 
 describe('识别状态', () => {

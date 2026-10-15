@@ -3,6 +3,7 @@
  *
  * 文件职责：把候选 DOM 安全序列化为可翻译文本槽，并在异步请求后依据源快照恢复到仍然匹配的真实节点。
  * 主要内容：定义 TranslationTextSlot、TranslationSourceSnapshot 与样式覆盖规则，重导出独立的纯文本槽协议，负责活节点收集（排除候选内的独立 tooltip）、译文写入克隆、可无损拍平骨架的整段原文重建与整块译文纯文本降级、隐藏/编辑/宿主 metadata 省略、可见公式骨架保全、译文产物过滤，以及支持同批样式/几何读数复用，识别 line-clamp 与溢出截断并提供临时解除截断的样式覆盖规则。 可核对的公开符号包括 TranslationTextSlot、TranslationSourceSnapshot、SerializedTranslationSlots、TranslationStyleOverride、translationTruncationStyleOverrides、serializeTranslationSlots、parseTranslationSlots、createTranslationSourceSnapshot、buildWholeBlockTranslationSource。
+ * 有界预准备：collectLiveTranslationTextSlotsFromNodes 仅遍历候选选中的原节点，共享同步保护缓存，沿用 owner 的 tooltip 边界且保留槽前后空白；不创建包装或读取未选中的兄弟子树。
  * 模块边界：本文件属于可独立测试的 core 候选领域；可以读取传入 DOM 以计算结果，但不访问配置存储、不调用 provider、不注册页面监听器，也不负责译文渲染或 feature 生命周期。
  */
 
@@ -168,6 +169,13 @@ function collectSlots(
     const slots: TranslationTextSlot[] = [];
     const document = root.ownerDocument;
     if (!document?.createTreeWalker) return slots;
+    const direct = root.firstChild;
+    if (direct?.nodeType === 3 && direct.nextSibling === null) {
+        const node = direct as Text;
+        const parts = translationTextSlotParts(node, shouldStayOriginal, ignoredExtensionElement, protectionOptions, protectionCache);
+        if (parts && !isTextInNestedTranslationTooltip(node, root)) slots.push({node, ...parts});
+        return slots;
+    }
     const walker = document.createTreeWalker(root, 4);
     let current = walker.nextNode();
     while (current) {
@@ -292,6 +300,38 @@ export function collectLiveTranslationTextSlots(
         protectionOptions,
         protectionCache,
     );
+}
+
+/** 仅遍历候选选中的根节点；不克隆或物化，tooltip 边界仍是原候选 owner。 */
+export function collectLiveTranslationTextSlotsFromNodes(
+    owner: HTMLElement,
+    roots: readonly Node[],
+    shouldStayOriginal?: (element: Element) => boolean,
+    protectionOptions?: TranslationTextProtectionOptions,
+): TranslationTextSlot[] {
+    const slots: TranslationTextSlot[] = [];
+    const seen = new Set<Text>();
+    const protectionCache = createTranslationTextProtectionCache();
+    const collect = (node: Text): void => {
+        if (seen.has(node)) return;
+        seen.add(node);
+        const parts = translationTextSlotParts(node, shouldStayOriginal, undefined, protectionOptions, protectionCache);
+        if (parts && !isTextInNestedTranslationTooltip(node, owner)) slots.push({node, ...parts});
+    };
+    for (const root of roots) {
+        if (!owner.contains(root)) continue;
+        if (root.nodeType === 3) {
+            collect(root as Text);
+            continue;
+        }
+        const walker = owner.ownerDocument.createTreeWalker(root, 4);
+        let node = walker.nextNode();
+        while (node) {
+            collect(node as Text);
+            node = walker.nextNode();
+        }
+    }
+    return slots;
 }
 
 /**

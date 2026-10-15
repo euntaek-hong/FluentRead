@@ -3,6 +3,7 @@
  *
  * 文件职责：提供各翻译入口共用的语言判断公开 API，把与目标无关的文本识别结论和配置中的目标语言、排除语言按同一规则比较。
  * 主要内容：detectlang 返回规范语言代码，可信识别优先、否则给出统计最佳猜测或混合正文的 franc-min 整体排序，普通话无法确定简繁时返回 cmn、没有正文证据时返回 und；shouldSkipTranslationForTarget 只在文本无字母或整段被可信识别为目标语言/任一排除语言时跳过，未知、混合与夹带外语句子一律保留翻译；detectChineseScript 报告可信的单一中文书写体系；划词与翻译卡片额外按纯 Han 选区跳过中文目标；从 confidence.ts 转出 Chrome 现代语言检测的最低置信度边界。可核对的公开符号包括 detectlang、shouldSkipTranslationForTarget、isTextInLanguage、detectChineseScript、shouldSkipChineseSelection、MIN_CHROME_LANGUAGE_CONFIDENCE。
+ * 快速路径：只有韩语可被跳过且没有谚文时按字母存在性直接决定；中文字体没有汉字证据时直接返回 undefined，避免无关的统计语言识别。存在相关文字或其他排除语言时仍走完整识别政策。
  * 模块边界：本文件属于 core 领域层，只组合 identify.ts 与 codes.ts 的纯规则，并保留 confidence.ts 的同名阈值出口；不读取浏览器存储、页面 lang 或配置，不发起网络请求，也不挂载 Vue/WXT 入口，是否强制翻译等交互语义由调用方决定。
  */
 
@@ -47,6 +48,11 @@ export function shouldSkipTranslationForTarget(
     targetLanguage: string,
     excludedLanguages: readonly string[] = [],
 ): boolean {
+    // identify.ts 只有 Hangul 证据才能可信识别为 ko；Latin 统计目录不含韩语。
+    // 这里只排除不可能匹配的目标，不替换文字混合、排除语言或空文本的策略。
+    if (isLanguageCodeMatch('ko', targetLanguage)
+        && excludedLanguages.every(language => isLanguageCodeMatch('ko', language))
+        && !/\p{Script=Hangul}/u.test(origin)) return !/\p{L}/u.test(origin);
     const identification = identifyTextLanguage(origin);
     if (identification.status === 'empty') return true;
     if (identification.status !== 'identified') return false;
@@ -56,6 +62,8 @@ export function shouldSkipTranslationForTarget(
 
 /** 只报告有明确中文证据且字形一致的文本，不为简繁同形中文猜测简体或繁体。 */
 export function detectChineseScript(value: string): ChineseScript | undefined {
+    // 中文字体只有汉字证据才可能成立；纯 Latin 等原文无需走统计语言识别。
+    if (!/\p{Script=Han}/u.test(value)) return undefined;
     const identification = identifyTextLanguage(value);
     if (identification.status !== 'identified' || identification.languages.length !== 1) return undefined;
     return getChineseScript(identification.languages[0]!);

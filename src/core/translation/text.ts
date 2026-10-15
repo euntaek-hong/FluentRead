@@ -2,7 +2,7 @@
  * @file src/core/translation/text.ts
  *
  * 文件职责：提取和校验候选中的可读文本，拒绝标识符、独立时间与数值（含拆分行内节点的展示）、空白、扩展译文及脚本、表单或敏感区域的节点。
- * 主要内容：提供文本规范化、仅确认至少两个 Unicode 字母的 meaningful 判定与共享的 identifier 模式判定、元素与文本节点保护检查、嵌套 tooltip 来源隔离、WeakMap 状态缓存和受预算约束的深度扫描；语言预检副本保留真实行内邻接，在换行、语义块和保护省略处保留边界，不改动翻译槽。 可核对的公开符号包括 normalizeTranslationText、isIdentifierLikeText、isMeaningfulTranslationText、setMinimumTranslationTextLength、isTranslationTextNodeProtected、TranslationTextProtectionCache、createTranslationTextProtectionCache、isTranslationTextElementProtected、hasMeaningfulTranslationTextInNodes。
+ * 主要内容：提供文本规范化、仅确认至少两个 Unicode 字母的 meaningful 判定与共享的 identifier 模式判定、元素与文本节点保护检查、嵌套 tooltip 来源隔离、WeakMap 状态缓存和受预算约束的深度扫描；同步只读批次可按回调身份和行内代码权限共享祖先保护，但 owner/来源槽/应用外壳例外仍独立读取；语言预检副本保留真实行内邻接，在换行、语义块和保护省略处保留边界，不改动翻译槽。 可核对的公开符号包括 normalizeTranslationText、isIdentifierLikeText、isMeaningfulTranslationText、setMinimumTranslationTextLength、isTranslationTextNodeProtected、TranslationTextProtectionCache、createTranslationTextProtectionCache、isTranslationTextElementProtected、hasMeaningfulTranslationTextInNodes。
  * 模块边界：本文件属于可独立测试的 core 候选领域；可以读取传入 DOM 以计算结果，但不访问配置存储、不调用 provider、不注册页面监听器，也不负责译文渲染或 feature 生命周期；文本语言与同目标跳过统一由 src/core/language 判断。
  */
 
@@ -11,8 +11,10 @@ import {
     isTextInNestedTranslationTooltip,
     getComposedParent,
     getElementTagName,
+    getTranslationDOMReadBatchToken,
     isProtectedDescendantElement,
     maxComposedAncestorDepth,
+    readTranslationComputedStyle,
 } from './dom';
 import type {TranslationTextProtectionOptions} from './dom';
 import {isNonTranslatableLiveData} from './liveData';
@@ -96,7 +98,7 @@ function languageContextBlockOwner(element: Element, cache: WeakMap<Element, Ele
     while (current && !cache.has(current) && chain.length < maxComposedAncestorDepth) {
         if (languageContextBlockTags.test(getElementTagName(current))) break;
         try {
-            const display = current.ownerDocument.defaultView?.getComputedStyle(current).display;
+            const display = readTranslationComputedStyle(current)?.display;
             if (display && display !== 'none' && display !== 'contents' && !/^(?:inline|ruby)/u.test(display)) break;
         } catch {
             // 无布局能力的文档仍沿语义标签寻找边界。
@@ -240,6 +242,14 @@ function collectReadableText(
         }
         const document = element.ownerDocument;
         if (!document?.createTreeWalker) continue;
+        const direct = element.firstChild;
+        if (!languageContext && direct?.nodeType === 3 && direct.nextSibling === null) {
+            const text = direct as Text;
+            if (!isTextInNestedTranslationTooltip(text, element) && !isTranslationTextNodeProtected(
+                text, shouldStayOriginal, ignoredExtensionElement, protectionOptions, protectionCache,
+            )) append(text, root);
+            continue;
+        }
         const walker = document.createTreeWalker(element, languageContext ? 5 : 4);
         let current = walker.nextNode();
         while (current) {
@@ -280,6 +290,21 @@ interface TranslationTextProtectionState {
 export type TranslationTextProtectionCache = WeakMap<Element, TranslationTextProtectionState>;
 // 原始 DOM 保护与祖先继承分开缓存；展示扫描提前读取的子元素不会重复强制布局。
 const rawProtectionCaches = new WeakMap<TranslationTextProtectionCache, WeakMap<Element, boolean>>();
+type SharedProtectionPolicy = {plain?: TranslationTextProtectionCache; language?: TranslationTextProtectionCache};
+const synchronousProtectionCaches = new WeakMap<object, Map<((element: Element) => boolean) | undefined, SharedProtectionPolicy>>();
+
+/** 只共享无 owner/外壳例外的纯读取；回调身份及行内代码权限分别隔离。 */
+function sharedTextProtectionCache(shouldStayOriginal: ((element: Element) => boolean) | undefined,
+    options: TranslationTextProtectionOptions | undefined, ignoredExtensionElement: Element | undefined): TranslationTextProtectionCache | undefined {
+    const batch = getTranslationDOMReadBatchToken();
+    if (!batch || ignoredExtensionElement || options?.sourceTextSlotHosts || options?.allowTopLevelApplicationShell) return undefined;
+    let callbacks = synchronousProtectionCaches.get(batch);
+    if (!callbacks) {callbacks = new Map(); synchronousProtectionCaches.set(batch, callbacks);}
+    let policy = callbacks.get(shouldStayOriginal);
+    if (!policy) {policy = {}; callbacks.set(shouldStayOriginal, policy);}
+    const key = options?.includeInlineCodeForLanguage === true ? 'language' : 'plain';
+    return policy[key] ?? (policy[key] = createTranslationTextProtectionCache());
+}
 
 export function createTranslationTextProtectionCache(): TranslationTextProtectionCache {
     return new WeakMap<Element, TranslationTextProtectionState>();
@@ -326,8 +351,9 @@ export function isTranslationTextElementProtected(
     protectionOptions?: TranslationTextProtectionOptions,
     ignoredExtensionElement?: Element,
 ): boolean {
-    const cached = protectionCache.get(element);
-    if (cached) return cached.protected;
+    const shared = sharedTextProtectionCache(shouldStayOriginal, protectionOptions, ignoredExtensionElement);
+    const cached = protectionCache.get(element) ?? shared?.get(element);
+    if (cached) {protectionCache.set(element, {...cached}); return cached.protected;}
 
     const rawCache = rawProtectionCaches.get(protectionCache) ?? new WeakMap<Element, boolean>();
     rawProtectionCaches.set(protectionCache, rawCache);
@@ -341,7 +367,7 @@ export function isTranslationTextElementProtected(
 
     const chain: Element[] = [];
     let current: Element | null = element;
-    while (current && !protectionCache.has(current)) {
+    while (current && !protectionCache.has(current) && !shared?.has(current)) {
         if (chain.length >= maxComposedAncestorDepth) {
             protectionCache.set(element, {
                 depth: maxComposedAncestorDepth + 1,
@@ -353,7 +379,7 @@ export function isTranslationTextElementProtected(
         current = getComposedParent(current);
     }
 
-    const inherited = current ? protectionCache.get(current) : undefined;
+    const inherited = current ? protectionCache.get(current) ?? shared?.get(current) : undefined;
     let depth = inherited?.depth ?? 0;
     let protectedByAncestor = inherited?.protected ?? false;
     for (let index = chain.length - 1; index >= 0; index -= 1) {
@@ -364,7 +390,9 @@ export function isTranslationTextElementProtected(
             isProtected(item) ||
             isLiveDataDisplay(item, isProtected) ||
             shouldStayOriginal?.(item) === true;
-        protectionCache.set(item, {depth, protected: protectedByAncestor});
+        const result = {depth, protected: protectedByAncestor};
+        protectionCache.set(item, result);
+        shared?.set(item, {...result});
     }
     return protectionCache.get(element)?.protected === true;
 }
@@ -379,6 +407,13 @@ export function hasMeaningfulTranslationTextInNodes(
     protectionCache = createTranslationTextProtectionCache(),
     protectionOptions?: TranslationTextProtectionOptions,
 ): boolean {
+    const root = roots.length === 1 ? roots[0] : undefined;
+    const direct = root?.nodeType === 1 ? root.firstChild : null;
+    if (direct?.nodeType === 3 && direct.nextSibling === null) {
+        if (isTranslationTextElementProtected(root as Element, shouldStayOriginal, protectionCache, protectionOptions)) return false;
+        const value = normalizeTranslationText((direct.nodeValue ?? '').slice(0, discoveryCharacterBudget));
+        return Boolean(value && !isNonTranslatableLiveData(value) && isMeaningfulTranslationText(value));
+    }
     const stack: Array<{node: Node; nextChildIndex: number; entered: boolean}> = [];
     const parts: string[] = [];
     let textNodes = 0;

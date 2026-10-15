@@ -14,6 +14,7 @@ import {
     findElementsAtPoint,
     findNodeAtPoint,
     getComposedParent,
+    getTranslationDOMReadBatchToken,
     getTranslatableControlValueAttribute,
     isDocumentSurface,
     isExtensionElementSelf,
@@ -100,6 +101,8 @@ interface ResolutionEvaluationContext {
     structuralAncestors: WeakMap<Element, boolean>;
     inlineRuns: WeakMap<Element, InlineRunSummary>;
 }
+
+const inspectionReadBatches = new WeakMap<object, WeakMap<TranslationCandidateCore, ResolutionEvaluationContext>>();
 
 function createResolutionEvaluationContext(
     textProtectionOptions?: TranslationTextProtectionOptions,
@@ -305,6 +308,7 @@ export class TranslationCandidateCore {
         element: Element,
         evaluationContext?: ResolutionEvaluationContext,
     ): AdapterPrunedAncestor | null {
+        if (this.adapters.length === 0) return null;
         if (evaluationContext?.adapterPrunedAncestors.has(element)) {
             return evaluationContext.adapterPrunedAncestors.get(element) ?? null;
         }
@@ -439,9 +443,16 @@ export class TranslationCandidateCore {
     }
 
     inspect(element: Element, textProtectionOptions?: TranslationTextProtectionOptions): TranslationCoreInspection {
-        const evaluationContext = createResolutionEvaluationContext(textProtectionOptions);
-        // 只在此同步只读 inspect 生效；resolve/discover 与不同 owner 不共享。
-        evaluationContext.adapterContext = {...this.context, closestSelectorMisses: new WeakMap()};
+        // 只有未携带 owner/可变槽权限的显式同步只读批次共享祖先判定。
+        const batch = textProtectionOptions ? undefined : getTranslationDOMReadBatchToken();
+        let contexts = batch ? inspectionReadBatches.get(batch) : undefined;
+        if (batch && !contexts) {contexts = new WeakMap(); inspectionReadBatches.set(batch, contexts);}
+        let evaluationContext = contexts?.get(this);
+        if (!evaluationContext) {
+            evaluationContext = createResolutionEvaluationContext(textProtectionOptions);
+            evaluationContext.adapterContext = {...this.context, closestSelectorMisses: new WeakMap()};
+            contexts?.set(this, evaluationContext);
+        }
         return this.inspectWithTextProtectionCache(
             element,
             evaluationContext.textProtectionCache,
@@ -455,7 +466,7 @@ export class TranslationCandidateCore {
         evaluationContext: ResolutionEvaluationContext,
     ): TranslationCoreInspection {
         const adapterContext = this.adapterContextForResolution(evaluationContext);
-        const shouldStayOriginal = evaluationContext?.adapterContext
+        const shouldStayOriginal = this.adapters.length > 0 && evaluationContext?.adapterContext
             ? (item: Element) => this.shouldStayOriginalWithContext(item, adapterContext)
             : this.shouldStayOriginal;
         const hardGuard = this.hardGuard(element, evaluationContext);

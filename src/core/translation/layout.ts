@@ -15,6 +15,7 @@ import {
     isPlainTextDocumentPre,
     isProtectedTextElement,
     maxComposedAncestorDepth,
+    readTranslationComputedStyle,
 } from './dom';
 import {
     hasMeaningfulTranslationTextInNodes,
@@ -69,8 +70,7 @@ export function isSemanticHeadingElement(element: Element): boolean {
 
 export function getElementDisplay(element: Element): string {
     try {
-        const view = element.ownerDocument?.defaultView;
-        return view?.getComputedStyle(element).display.trim().toLowerCase() ?? '';
+        return readTranslationComputedStyle(element)?.display.trim().toLowerCase() ?? '';
     } catch {
         return '';
     }

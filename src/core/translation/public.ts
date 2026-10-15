@@ -34,6 +34,7 @@ export {
     getTranslatableControlValueAttribute,
     isProtectedDescendantElement,
     isTopLevelApplicationShell,
+    withTranslationDOMReadBatch,
 } from './dom';
 export type {TranslationTextProtectionOptions} from './dom';
 export {
@@ -59,6 +60,7 @@ export {
     applyTranslationsToSnapshot,
     buildWholeBlockTranslationSource,
     collectLiveTranslationTextSlots,
+    collectLiveTranslationTextSlotsFromNodes,
     createTranslationSourceSnapshot,
     hasActiveTranslationLineClamp,
     hasActiveTranslationTruncation,
