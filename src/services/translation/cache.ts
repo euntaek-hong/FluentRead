@@ -1,7 +1,7 @@
 /**
  * @file src/services/translation/cache.ts
  *
- * 文件职责：实现扩展自有的翻译结果缓存，统一键规范化、确定超限写入的早拒绝、TTL、可配置双容量限制、内存热层和 Dexie 持久层。
+ * 文件职责：实现扩展自有的翻译结果缓存，统一键规范化、超限早拒绝、TTL、双容量限制、内存热层与 Dexie 持久层；独立翻译槽可在一个事务内批量持久化。
  * 主要内容：定义缓存 identity/record、canonicalize 与 buildTranslationCacheKey，维护 FluentReadCacheDatabase 与事务内增量用量汇总，并通过 translationCache 提供读取、写入、按短窗口合批写回的持久化 LRU、过期清理、阈值设置和用量统计；缓存读写故障降级，管理故障向 UI 如实报告。 可核对的公开符号包括 TRANSLATION_CACHE_VERSION、TRANSLATION_CACHE_TTL_MS、TRANSLATION_CACHE_MAX_ENTRY_BYTES、TRANSLATION_CACHE_MEMORY_ENTRIES、TranslationCacheIdentity、TranslationCacheRecord。
  * 模块边界：本文件位于翻译 application service 层，负责用例编排和端口契约；不挂载页面 UI，且不应把某家供应商的网络细节扩散到 feature，具体 HTTP 协议由 providers/platform 实现。
  */
@@ -317,6 +317,48 @@ class TranslationCache {
     } catch (error) {
       console.warn('[FluentRead] translation cache write failed:', error);
       return false;
+    }
+  }
+
+  /** 同一 provider 批次只开启一个事务；重复 key 以最后一个有效值为准，结果仍逐项对齐。 */
+  async setMany(entries: readonly (readonly [string, string])[], now = Date.now()): Promise<boolean[]> {
+    const accepted = entries.map(([key, translation]) => {
+      if (key.length + translation.length > TRANSLATION_CACHE_MAX_ENTRY_BYTES) return undefined;
+      const byteSize = getByteSize(key) + getByteSize(translation);
+      if (!translation || byteSize > TRANSLATION_CACHE_MAX_ENTRY_BYTES) return undefined;
+      return {key, translation, createdAt: now, lastAccessedAt: now, expiresAt: now + TRANSLATION_CACHE_TTL_MS, byteSize};
+    });
+    const byKey = new Map(accepted.filter((record): record is TranslationCacheRecord => record !== undefined)
+      .map(record => [record.key, record]));
+    const records = [...byKey.values()];
+    if (records.length === 0) return entries.map(() => false);
+    const epoch = this.clearEpoch;
+    let writeRevision = this.contentRevision;
+    let persisted = new Set<string>();
+    await this.flushPendingTouches();
+    try {
+      await translationCacheDb.transaction('rw', translationCacheDb.entries, translationCacheDb.totals, async () => {
+        if (epoch !== this.clearEpoch) return;
+        const totals = await this.readTotals();
+        const previous = await translationCacheDb.entries.bulkGet(records.map(record => record.key));
+        records.forEach((record, index) => {
+          totals.bytes += record.byteSize - (previous[index]?.byteSize ?? 0);
+          if (!previous[index]) totals.entries += 1;
+        });
+        await translationCacheDb.entries.bulkPut(records);
+        this.contentRevision += 1;
+        records.forEach(record => this.memory.delete(record.key));
+        const removed = await this.prune(totals, now);
+        await translationCacheDb.totals.put(totals);
+        persisted = new Set(records.filter(record => !removed.has(record.key)).map(record => record.key));
+        writeRevision = this.contentRevision;
+      });
+      if (epoch !== this.clearEpoch || writeRevision !== this.contentRevision) return entries.map(() => false);
+      records.forEach(record => { if (persisted.has(record.key)) this.remember(record); });
+      return accepted.map(record => Boolean(record && byKey.get(record.key) === record && persisted.has(record.key)));
+    } catch (error) {
+      console.warn('[FluentRead] translation cache write failed:', error);
+      return entries.map(() => false);
     }
   }
 

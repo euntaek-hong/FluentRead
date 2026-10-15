@@ -47,6 +47,55 @@ describe('translation cache identity', () => {
     await resetCache();
   });
 
+  it('persists independent translation slots in one transaction with accurate totals', async () => {
+    const transaction = vi.spyOn(translationCacheDb,'transaction');
+    const entries = Array.from({length:22},(_,index) => [`batch-${index}`,`独立译文 ${index}`] as const);
+    await expect(translationCache.setMany(entries,1_000)).resolves.toEqual(entries.map(()=>true));
+    expect(transaction).toHaveBeenCalledOnce();
+    for (const [key,value] of entries) await expect(translationCache.get(key,1_001)).resolves.toBe(value);
+    const stats=await translationCache.getStats(1_001);
+    expect(stats.entries).toBe(22);
+    expect(stats.bytes).toBe(entries.reduce((sum,[key,value])=>sum+new TextEncoder().encode(key).length+new TextEncoder().encode(value).length,0));
+  });
+
+  it('rejects oversized bulk entries without dropping valid independent slots', async () => {
+    await expect(translationCache.setMany([
+      ['too-long', 'x'.repeat(TRANSLATION_CACHE_MAX_ENTRY_BYTES)],
+      ['too-many-bytes', '字'.repeat(100_000)],
+      ['valid', '译文'],
+    ], 1_000)).resolves.toEqual([false, false, true]);
+    await expect(translationCacheDb.entries.count()).resolves.toBe(1);
+  });
+
+  it('keeps bulk replacement totals accurate and does not promote records pruned in the same transaction', async () => {
+    await translationCache.setLimits({maxBytes: TRANSLATION_CACHE_MAX_BYTES, maxEntries: 100}, 0);
+    await translationCache.setMany([['aaa-replace', 'old']], 1_000);
+    const entries = Array.from({length: 101}, (_, index) => [`entry-${index}`, '值'] as const);
+    await expect(translationCache.setMany([['aaa-replace', 'new'], ...entries], 2_000))
+      .resolves.toEqual([false, false, ...Array.from({length: 100}, () => true)]);
+    await expect(translationCache.get('aaa-replace', 2_001)).resolves.toBeNull();
+    const stored = await translationCacheDb.entries.toArray();
+    await expect(translationCache.getStats(2_001)).resolves.toMatchObject({
+      entries: 100, bytes: stored.reduce((bytes, record) => bytes + record.byteSize, 0),
+    });
+  });
+
+  it('returns per-slot failures when a bulk transaction fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(translationCacheDb, 'transaction').mockRejectedValueOnce(new Error('blocked'));
+    await expect(translationCache.setMany([['one', '值']], 1_000)).resolves.toEqual([false]);
+    expect(warn).toHaveBeenCalledWith('[FluentRead] translation cache write failed:', expect.any(Error));
+  });
+
+  it('deduplicates a bulk write, rejects empty values and retains per-slot results', async () => {
+    await expect(translationCache.setMany([
+      ['duplicate','Older value'],['empty',''],['duplicate','Newest value'],
+    ],1_000)).resolves.toEqual([false,false,true]);
+    await expect(translationCache.get('duplicate',1_001)).resolves.toBe('Newest value');
+    await expect(translationCache.get('empty',1_001)).resolves.toBeNull();
+    await expect(translationCache.setMany([],1_000)).resolves.toEqual([]);
+  });
+
   it('canonicalizes every supported primitive and structural type deterministically', () => {
     const symbol = Symbol('cache');
     const fn = function cacheIdentity() { return 'ignored'; };
@@ -298,7 +347,7 @@ describe('translation cache persistence policy', () => {
     expect(getSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('clear invalidates a write that entered the old epoch before its transaction starts', async () => {
+  it.each(['single', 'bulk'])('clear invalidates a %s write that entered the old epoch before its transaction starts', async (method) => {
     let releaseTransaction!: () => void;
     const transactionGate = new Promise<void>((resolve) => {
       releaseTransaction = resolve;
@@ -311,13 +360,15 @@ describe('translation cache persistence policy', () => {
       }
     ) as never);
 
-    const staleWrite = translationCache.set('clear-write-race', '旧代译文', 5_000);
+    const staleWrite = method === 'single'
+      ? translationCache.set('clear-write-race', '旧代译文', 5_000)
+      : translationCache.setMany([['clear-write-race', '旧代译文']], 5_000);
     await vi.waitFor(() => expect(transactionSpy).toHaveBeenCalledOnce());
 
     await translationCache.clear();
     releaseTransaction();
 
-    await expect(staleWrite).resolves.toBe(false);
+    expect(await staleWrite).toEqual(method === 'single' ? false : [false]);
     await expect(translationCacheDb.entries.get('clear-write-race')).resolves.toBeUndefined();
     await expect(translationCache.get('clear-write-race', 6_000)).resolves.toBeNull();
   });
@@ -541,7 +592,7 @@ describe('translation cache delayed operation races', () => {
     await expect(translationCache.get('victim', 2_001)).resolves.toBeNull();
   });
 
-  it.each(['evicted', 'replaced', 'cleared'])('does not revive a committed write whose return is delayed until it is %s', async (state) => {
+  it.each(['single', 'bulk'].flatMap(method => ['evicted', 'replaced', 'cleared'].map(state => ({method, state}))))('does not revive a committed $method write whose return is delayed until it is $state', async ({method, state}) => {
     await translationCacheDb.entries.bulkPut(Array.from({ length: 99 }, (_, index) => (
       record(`keep-${index}`, { lastAccessedAt: 2_000 + index })
     )));
@@ -557,13 +608,18 @@ describe('translation cache delayed operation races', () => {
       await gate;
       return result;
     }) as never);
-    const oldWrite = translationCache.set('delayed-write', 'old', 1_000);
+    const oldWrite = method === 'single'
+      ? translationCache.set('delayed-write', 'old', 1_000)
+      : translationCache.setMany([['delayed-write', 'old']], 1_000);
     await committed;
     if (state === 'evicted') await translationCache.set('newest', 'new', 3_000);
-    if (state === 'replaced') await translationCache.set('delayed-write', 'replacement', 3_000);
+    if (state === 'replaced') {
+      if (method === 'bulk') await translationCache.setMany([['delayed-write', 'replacement']], 3_000);
+      else await translationCache.set('delayed-write', 'replacement', 3_000);
+    }
     if (state === 'cleared') await translationCache.clear();
     release();
-    await expect(oldWrite).resolves.toBe(false);
+    expect(await oldWrite).toEqual(method === 'single' ? false : [false]);
     await expect(translationCache.get('delayed-write', 3_001)).resolves.toBe(state === 'replaced' ? 'replacement' : null);
   });
 

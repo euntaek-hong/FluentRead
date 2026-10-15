@@ -124,6 +124,8 @@ export interface TranslationLanguages {
 export interface TranslationCachePort {
     get: (key: string) => Promise<string | null>;
     set: (key: string, value: string) => Promise<boolean>;
+    /** 可选的内部批次持久化；每个槽位仍保留独立 key 与译文。 */
+    setMany?: (entries: readonly (readonly [string, string])[]) => Promise<boolean[]>;
     clear: () => Promise<void>;
     cleanup: () => Promise<void>;
 }

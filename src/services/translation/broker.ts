@@ -3,6 +3,7 @@
  *
  * 文件职责：编排翻译请求的配置快照、语言解析、缓存、请求去重、超时与 provider 调用，是后台翻译用例的中心服务。
  * 主要内容：createTranslationBroker 同时支持单条、批量和页面摘要，验证 provider 返回数量、类型及明显的原文回显或错语种，空来源在本地保留，仅在原生批次响应结构异常时以相同取消所有权和剩余 deadline 逐段恢复，整批完成前不发布缓存；对完整多段协议逐槽修复上下文回显并拒绝空译文，以包含 Chrome auto 检测样本的完整身份构建缓存键，并按实际消费的云地域和凭据摘要、匿名额度身份、等待策略、清理代次与剩余 deadline 隔离 pending 请求；入口在等待前复制消息，ready 与取消检查后沿用可信配置快照，仅未附着的公开请求复制备用配置；批次摘要与分项缓存键只构建一次并复用，重复身份只读写一次；每次公开请求累计缓存复用、上游调用次数、耗时与免费链线路尝试，结束后向注入的统计端口交付只含规模数值、服务与线路标识的事件。 可核对的公开符号包括 createTranslationBroker、聚合导出。
+ * 批次持久化：可选缓存端口把独立槽位合为一个数据库事务，仍沿用有限等待、逐 key pending 值身份和 clear 代次排空；没有该能力的端口继续逐项写入。
  * 模块边界：本文件位于翻译 application service 层，负责用例编排和端口契约；文本槽编码与解析复用 core/translation/slotProtocol.ts 纯协议，不初始化 DOM 候选或网站规则；不挂载页面 UI，且不应把某家供应商的网络细节扩散到 feature，具体 HTTP 协议由 providers/platform 实现。
  */
 
@@ -1213,6 +1214,38 @@ export function createTranslationBroker(deps: TranslationBrokerDependencies): Tr
         );
     }
 
+    async function writeCacheBatchIfCurrent(generation: number, entries: readonly (readonly [string, string])[]): Promise<void> {
+        if (generation !== cacheGeneration) return;
+        const pendingValues = entries.map(([key, value]) => [key, {generation, value}] as const);
+        const write = Promise.resolve().then(() => deps.cache.setMany!(entries));
+        pendingValues.forEach(([key, value]) => pendingCacheValues.set(key, value));
+        pendingCacheWrites.set(write, generation);
+        try {
+            await write;
+        } finally {
+            pendingCacheWrites.delete(write);
+            pendingValues.forEach(([key, value]) => {
+                if (pendingCacheValues.get(key) === value) pendingCacheValues.delete(key);
+            });
+        }
+    }
+
+    async function persistCacheBatch(generation: number, entries: readonly (readonly [string, string])[]): Promise<void> {
+        if (!deps.cache.setMany) {
+            await Promise.all(entries.map(([key, value]) => persistCacheWrite(generation, key, value)));
+            return;
+        }
+        // 与单项写相同：消息等待有限宽限期，clear 仍等待真实事务完成。
+        await waitForBoundedPersistence(
+            Promise.resolve().then(() => writeCacheBatchIfCurrent(generation, entries)),
+            {
+                graceMs: deps.persistenceGraceMs,
+                onFailure: (error) => warn('[FluentRead] translation cache write failed:', error),
+                onTimeout: (error) => warn('[FluentRead] translation cache write timed out:', error),
+            },
+        );
+    }
+
     async function addPageSummary(
         execution: TranslationRequestExecution,
         pageContext: string,
@@ -1555,7 +1588,7 @@ export function createTranslationBroker(deps: TranslationBrokerDependencies): Tr
 
             // 步骤 2：按原请求顺序回填结果，并只缓存有效译文。
             const result = [...validatedCached] as Array<string | null>;
-            const cacheWrites: Promise<void>[] = [];
+            const cacheWrites: Array<readonly [string, string]> = [];
             const writtenKeys = new Set<string>();
             missingEntries.forEach(({index, origin}) => {
                 const itemKey = itemKeys[index];
@@ -1563,15 +1596,11 @@ export function createTranslationBroker(deps: TranslationBrokerDependencies): Tr
                 result[index] = value as string;
                 if (!writtenKeys.has(itemKey) && isCacheableResult(origin, value, execution.targetLanguage, execution.config)) {
                     writtenKeys.add(itemKey);
-                    cacheWrites.push(persistCacheWrite(
-                        requestGeneration,
-                        itemKey,
-                        value,
-                    ));
+                    cacheWrites.push([itemKey, value]);
                 }
             });
 
-            await Promise.all(cacheWrites);
+            await persistCacheBatch(requestGeneration, cacheWrites);
             return result as string[];
         })() : callBatchProviderWithContextRecovery(
             execution,

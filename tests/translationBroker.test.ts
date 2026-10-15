@@ -164,6 +164,7 @@ function installBroker(
     includeModelUsageGeneration = true,
     persistenceGraceMs?: number,
     current: TranslationConfigSource = mocks.config,
+    cacheSetMany?: (entries: readonly (readonly [string, string])[]) => Promise<boolean[]>,
 ): void {
     const broker = createTranslationBroker({
         ready,
@@ -172,6 +173,7 @@ function installBroker(
         cache: {
             get: mocks.cacheGet,
             set: mocks.cacheSet,
+            ...(cacheSetMany ? {setMany: cacheSetMany} : {}),
             clear: mocks.cacheClear,
             cleanup: mocks.cacheCleanup,
         },
@@ -1486,6 +1488,105 @@ describe('translation broker', () => {
             targetLanguage: 'zh-Hans',
         })).resolves.toEqual(['same-译文', 'other-译文']);
         expect(mocks.service).not.toHaveBeenCalled();
+    });
+
+    it('persists independent native batch slots through one optional cache transaction', async () => {
+        const setMany = vi.fn(async (entries: readonly (readonly [string, string])[]) => {
+            entries.forEach(([key, value]) => mocks.cacheStore.set(key, value));
+            return entries.map(() => true);
+        });
+        installBroker(undefined, Promise.resolve(), true, undefined, mocks.config, setMany);
+        mocks.service.mockResolvedValueOnce(['甲译文', '乙译文']);
+
+        await expect(translateWithCache({origin: ['Alpha', 'Alpha', 'Beta']}))
+            .resolves.toEqual(['甲译文', '甲译文', '乙译文']);
+        expect(setMany).toHaveBeenCalledOnce();
+        expect(setMany.mock.calls[0][0].map(([, value]) => value)).toEqual(['甲译文', '乙译文']);
+        expect(mocks.cacheSet).not.toHaveBeenCalled();
+        await expect(translateWithCache({origin: ['Beta', 'Alpha']})).resolves.toEqual(['乙译文', '甲译文']);
+        expect(mocks.service).toHaveBeenCalledOnce();
+    });
+
+    it('returns translated slots after a bulk cache failure and releases their pending ownership', async () => {
+        const failure = new Error('Bulk persistence unavailable');
+        const setMany = vi.fn().mockRejectedValue(failure);
+        const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        installBroker(undefined, Promise.resolve(), true, undefined, mocks.config, setMany);
+        mocks.service.mockResolvedValueOnce(['甲译文', '乙译文']);
+        await expect(translateWithCache({origin: ['Alpha', 'Beta']})).resolves.toEqual(['甲译文', '乙译文']);
+        expect(warning).toHaveBeenCalledWith('[FluentRead] translation cache write failed:', failure);
+        mocks.service.mockResolvedValueOnce(['新甲译文', '新乙译文']);
+        await expect(translateWithCache({origin: ['Alpha', 'Beta']})).resolves.toEqual(['新甲译文', '新乙译文']);
+        expect(mocks.service).toHaveBeenCalledTimes(2);
+        expect(setMany).toHaveBeenCalledTimes(2);
+        await clearTranslationCache();
+        expect(mocks.cacheClear).toHaveBeenCalledOnce();
+    });
+
+    it('keeps bulk persistence pending values and drains its transaction before clearing', async () => {
+        vi.useFakeTimers();
+        const persisted = deferred<boolean[]>();
+        const setMany = vi.fn(async (entries: readonly (readonly [string, string])[]) => {
+            const result = await persisted.promise;
+            entries.forEach(([key, value]) => mocks.cacheStore.set(key, value));
+            return result;
+        });
+        installBroker(undefined, Promise.resolve(), true, 25, mocks.config, setMany);
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        mocks.service.mockResolvedValueOnce(['甲译文', '乙译文']);
+        const first = translateWithCache({origin: ['Alpha', 'Beta']});
+        await flushMicrotasks(100);
+        expect(setMany).toHaveBeenCalledOnce();
+        await vi.advanceTimersByTimeAsync(25);
+        await expect(first).resolves.toEqual(['甲译文', '乙译文']);
+        mocks.cacheGet.mockClear();
+        await expect(translateWithCache({origin: ['Beta', 'Alpha']})).resolves.toEqual(['乙译文', '甲译文']);
+        expect(mocks.cacheGet).not.toHaveBeenCalled();
+        const clearing = clearTranslationCache();
+        await flushMicrotasks();
+        expect(mocks.cacheClear).not.toHaveBeenCalled();
+        persisted.resolve([true, true]);
+        await clearing;
+        expect(mocks.cacheClear).toHaveBeenCalledOnce();
+        expect(mocks.cacheStore.size).toBe(0);
+    });
+
+    it('does not discard a newer overlapping bulk pending value when the old transaction settles', async () => {
+        vi.useFakeTimers();
+        const oldProvider = deferred<string[]>();
+        const newProvider = deferred<string[]>();
+        const oldWrite = deferred<boolean[]>();
+        const newWrite = deferred<boolean[]>();
+        const setMany = vi.fn()
+            .mockImplementationOnce(() => oldWrite.promise)
+            .mockImplementationOnce(() => newWrite.promise);
+        installBroker(undefined, Promise.resolve(), true, 25, mocks.config, setMany);
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        mocks.service.mockImplementationOnce(() => oldProvider.promise).mockImplementationOnce(() => newProvider.promise);
+        const oldBatch = translateWithCache({origin: ['Overlap', 'Old batch']});
+        const newBatch = translateWithCache({origin: ['Overlap', 'New batch']});
+        await flushMicrotasks(100);
+        expect(mocks.service).toHaveBeenCalledTimes(2);
+        oldProvider.resolve(['旧译文', '旧批译文']);
+        await flushMicrotasks(100);
+        newProvider.resolve(['新译文', '新批译文']);
+        await flushMicrotasks(100);
+        expect(setMany).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(25);
+        await expect(oldBatch).resolves.toEqual(['旧译文', '旧批译文']);
+        await expect(newBatch).resolves.toEqual(['新译文', '新批译文']);
+        oldWrite.resolve([true, true]);
+        await flushMicrotasks(100);
+        mocks.cacheGet.mockClear();
+        await expect(translateWithCache({origin: ['Overlap']})).resolves.toEqual(['新译文']);
+        expect(mocks.cacheGet).not.toHaveBeenCalled();
+        expect(mocks.service).toHaveBeenCalledTimes(2);
+        newWrite.resolve([false, true]);
+        await flushMicrotasks(100);
+        setMany.mockResolvedValueOnce([true]);
+        mocks.service.mockResolvedValueOnce(['重新请求译文']);
+        await expect(translateWithCache({origin: ['Overlap']})).resolves.toEqual(['重新请求译文']);
+        expect(mocks.service).toHaveBeenCalledTimes(3);
     });
 
     it('persists unchanged batch items so ambiguous target-language text is not translated again', async () => {
@@ -3390,7 +3491,12 @@ describe('translation broker', () => {
         expect(mocks.service.mock.calls.filter(([message]) => message.summaryPrompt)).toHaveLength(2);
     });
 
-    it('清理期间使未完成的单条与批量请求失效，旧结果不能重新写缓存或继续参与去重', async () => {
+    it.each([false, true])('清理期间使未完成的单条与批量请求失效，旧结果不能重新写缓存或继续参与去重 (bulk=%s)', async bulk => {
+        const setMany = vi.fn(async (entries: readonly (readonly [string, string])[]) => {
+            entries.forEach(([key, value]) => mocks.cacheStore.set(key, value));
+            return entries.map(() => true);
+        });
+        if (bulk) installBroker(undefined, Promise.resolve(), true, undefined, mocks.config, setMany);
         let resolveSingle!: (value: string) => void;
         mocks.service.mockImplementationOnce(() => new Promise<string>((resolve) => {
             resolveSingle = resolve;
@@ -3419,10 +3525,12 @@ describe('translation broker', () => {
         resolveBatch(['旧 A', '旧 B']);
         await expect(staleBatch).resolves.toEqual(['旧 A', '旧 B']);
         expect(mocks.cacheSet).not.toHaveBeenCalled();
+        expect(setMany).not.toHaveBeenCalled();
 
         mocks.service.mockResolvedValueOnce(['新 A', '新 B']);
         await expect(translateWithCache({origin: ['stale-a', 'stale-b']})).resolves.toEqual(['新 A', '新 B']);
         expect(mocks.service).toHaveBeenCalledTimes(4);
+        expect(setMany).toHaveBeenCalledTimes(bulk ? 1 : 0);
     });
 
     it('清理使未完成的 AI 摘要失效，完成后的原请求可用但下一请求必须重新生成摘要', async () => {
